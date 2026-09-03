@@ -69,6 +69,7 @@
     <div class="bar">
       <button id="btnDim">画面を暗く</button>
       <button id="btnRelearn">背景を学習し直す</button>
+      <button id="btnOne">1人分の大きさを記憶</button>
       <button id="btnPause">一時停止</button>
       <button id="btnCsv">CSV/共有</button>
       <button id="btnSend">今すぐ送信</button>
@@ -118,7 +119,7 @@ const LS = {
   get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
-let cfg = LS.get("vc_cfg_oh", { line: null, flip: false, fps: 8, sens: 25, minPct: 0.6, split: true,
+let cfg = LS.get("vc_cfg_oh", { line: null, flip: false, fps: 8, sens: 25, minPct: 0.6, split: true, typical: 0,
   url: "", token: "", interval: 5, name: "入口1", camId: "" });
 let data = LS.get("vc_data_oh", { totalIn: 0, totalOut: 0, hourly: {}, events: [] });
 let mode = "setup";          // setup | run | settings
@@ -158,7 +159,7 @@ let bg = null, gray = null, fg = null, fg2 = null, lab = null, absorb = null, ty
 async function loadModel() {
   BH = Math.max(40, Math.round(BW * vh / vw)); bcv.width = BW; bcv.height = BH;
   gray = new Float32Array(BW * BH); fg = new Uint8Array(BW * BH); absorb = new Uint8Array(BW * BH); fg2 = new Uint8Array(BW * BH); lab = new Int32Array(BW * BH);
-  bg = null; typicalArea = 0; detector = { ready: true };
+  bg = null; typicalArea = cfg.typical || 0; detector = { ready: true };
 }
 function relearnBackground() { bg = null; tracks.clear(); }
 function detectBlobs() {
@@ -330,8 +331,9 @@ function updateTrack(id, pt, now) {
   t.pt = pt; t.lastSide = s; t.seen = now;
   return dir;
 }
-function record(dir) {
+function record(dir, k = 1) {
   const d = new Date();
+  if (k > 1) { for (let i = 0; i < k; i++) record(dir, 1); return; }
   const hour = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
   data.hourly[hour] = data.hourly[hour] || { in: 0, out: 0 };
   data.hourly[hour][dir]++;
@@ -360,8 +362,10 @@ async function tick() {
     const moved = Math.hypot(m.det.x - t.origin.x, m.det.y - t.origin.y);
     if (Math.hypot(m.det.x - t.movePt.x, m.det.y - t.movePt.y) > vw * 0.03) { t.movePt = { x: m.det.x, y: m.det.y }; t.lastMove = Date.now(); }
     // 典型サイズ: 明らかに移動していて、端にかかっておらず、細長くない塊から学習
-    if (m.det.area && moved > vw * 0.08 && !m.det.edge && m.det.aspect < 1.5)
-      typicalArea = !typicalArea ? m.det.area : (m.det.area > typicalArea ? typicalArea + (m.det.area - typicalArea) * 0.2 : typicalArea + (m.det.area - typicalArea) * 0.03);
+    if (m.det.area && moved > vw * 0.08 && !m.det.edge && m.det.aspect < 1.5) {
+      const r = cfg.typical ? 0.02 : 0.2;  // 手動で記憶済みなら、自動学習はごく緩やかに
+      typicalArea = !typicalArea ? m.det.area : (m.det.area > typicalArea ? typicalArea + (m.det.area - typicalArea) * r : typicalArea + (m.det.area - typicalArea) * 0.02);
+    }
     // 3秒以上動いていない塊は背景に吸収させる（置き物・背景の作り直し残り）
     if (Date.now() - t.lastMove > 3000) {
       const bb = m.det.bb, kx = BW / vw, ky = BH / vh;
@@ -373,7 +377,13 @@ async function tick() {
   for (const m of matched) {
     const dir = updateTrack(m.id, { x: m.det.x, y: m.det.y }, Date.now());
     if (window.__vcDebug) (window.__vcLog = window.__vcLog || []).push([window.__lastFi, m.id, Math.round(m.det.x), Math.round(m.det.y), dir]);
-    if (dir) { record(dir); $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600); }
+    if (dir) {
+      // まとまって通った場合: 塊の大きさ ÷ 1人分 で人数を推定（1〜4人）
+      let k = 1;
+      if (cfg.split && typicalArea > 0 && m.det.area) k = Math.max(1, Math.min(4, Math.round(m.det.area / typicalArea)));
+      record(dir, k); $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600);
+      if (k > 1) { ctx.fillStyle = "#fff"; ctx.font = "bold 28px sans-serif"; ctx.fillText(`${k}人`, m.det.x + 10, m.det.y); }
+    }
     const t = tracks.get(m.id); const col = t.counted.length ? "#ff9f0a" : "#4cd964";
     ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.strokeRect(m.det.bb.originX, m.det.bb.originY, m.det.bb.width, m.det.bb.height);
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(m.det.x, m.det.y, 5, 0, Math.PI * 2); ctx.fill();
@@ -382,7 +392,7 @@ async function tick() {
   if (cfg.url && Date.now() - lastSendAt > cfg.interval * 60000) send();
 }
 function renderStatus() {
-  const s = `${vw}×${vh}  処理 ${inferMs.toFixed(1)}ms/コマ  コマ ${processed}  前景 ${(fgRatio * 100).toFixed(0)}%  追跡中 ${tracks.size}` +
+  const s = `${vw}×${vh}  処理 ${inferMs.toFixed(1)}ms/コマ  コマ ${processed}  前景 ${(fgRatio * 100).toFixed(0)}%  1人分 ${typicalArea ? (typicalArea / (BW * BH) * 100).toFixed(1) + "%" : "未学習"}  追跡中 ${tracks.size}` +
     (cfg.url ? `  送信 ${lastSendAt ? new Date(lastSendAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "未"}` : "  送信なし（端末内保存）");
   $("status").textContent = s;
 }
@@ -458,6 +468,14 @@ $("btnReset").onclick = () => { if (confirm("カウントと記録をすべて�
 $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
 $("btnDim").onclick = () => { $("dim").style.display = "block"; };
 $("btnRelearn").onclick = () => { relearnBackground(); };
+$("btnOne").onclick = () => {
+  // いま映っている一番大きな塊を「1人分」として記憶（1人だけ映っている状態で押す）
+  const dets = detectBlobs();
+  if (!dets.length) { alert("人が映っていません。1人だけカメラの下に立ってから押してください"); return; }
+  const big = dets.reduce((a, b) => (b.area > a.area ? b : a));
+  typicalArea = big.area; cfg.typical = big.area; LS.set("vc_cfg_oh", cfg);
+  alert(`1人分の大きさを記憶しました（画面の ${(big.area / (BW * BH) * 100).toFixed(1)}%）`);
+};
 $("dim").onclick = () => { $("dim").style.display = "none"; };
 
 // ---------------------------------------------------------------- 起動
