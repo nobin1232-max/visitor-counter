@@ -92,6 +92,8 @@
     <input type="text" id="optToken">
     <label>送信間隔（分）</label>
     <select id="optInterval"><option value="5" selected>5</option><option value="10">10</option><option value="30">30</option></select>
+    <label>使うカメラ<span class="small">　iPhoneは「背面」推奨。Macで試すときは FaceTime HD を選ぶ</span></label>
+    <select id="optCam"><option value="">自動（背面カメラ）</option></select>
     <label>この端末の名前（複数入口があるとき）</label>
     <input type="text" id="optName" value="入口1">
     <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap">
@@ -116,7 +118,7 @@ const LS = {
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
 let cfg = LS.get("vc_cfg", { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true,
-  url: "", token: "", interval: 5, name: "入口1" });
+  url: "", token: "", interval: 5, name: "入口1", camId: "" });
 let data = LS.get("vc_data", { totalIn: 0, totalOut: 0, hourly: {}, events: [] });
 let mode = "setup";          // setup | run | settings
 let detector = null, stream = null, timer = null, wakeLock = null;
@@ -137,8 +139,11 @@ function extLine() {
 
 // ---------------------------------------------------------------- カメラ・モデル
 async function startCamera() {
-  stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15, max: 30 } }, audio: false });
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  const vc = { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15, max: 30 } };
+  if (cfg.camId) vc.deviceId = { exact: cfg.camId }; else vc.facingMode = "environment";
+  try { stream = await navigator.mediaDevices.getUserMedia({ video: vc, audio: false }); }
+  catch (e) { cfg.camId = ""; stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false }); }
   video.srcObject = stream;
   await new Promise((r) => (video.onloadedmetadata = r));
   await video.play();
@@ -351,6 +356,12 @@ function showSettings() {
   $("optFps").value = cfg.fps; $("optConf").value = cfg.conf; $("optAnchor").value = cfg.anchor; $("optMotion").value = cfg.motion ? "1" : "0";
   $("optUrl").value = cfg.url; $("optToken").value = cfg.token; $("optInterval").value = cfg.interval; $("optName").value = cfg.name;
   $("logBox").value = csvText();
+  navigator.mediaDevices.enumerateDevices().then((devs) => {
+    const sel = $("optCam"); sel.innerHTML = '<option value="">自動（背面カメラ）</option>';
+    devs.filter((d) => d.kind === "videoinput").forEach((d, i) => {
+      const o = document.createElement("option"); o.value = d.deviceId; o.textContent = d.label || `カメラ ${i + 1}`; sel.appendChild(o); });
+    sel.value = cfg.camId || "";
+  }).catch(() => {});
 }
 $("btnStart").onclick = () => { if (!cfg.line) { alert("先にラインを引いてください"); return; } showRun(); };
 $("btnStop").onclick = showSetup;
@@ -358,7 +369,10 @@ $("btnSettings").onclick = showSettings;
 $("btnSaveSettings").onclick = () => {
   cfg.fps = +$("optFps").value; cfg.conf = +$("optConf").value; cfg.anchor = $("optAnchor").value; cfg.motion = $("optMotion").value === "1";
   cfg.url = $("optUrl").value.trim(); cfg.token = $("optToken").value.trim(); cfg.interval = +$("optInterval").value; cfg.name = $("optName").value.trim() || "入口1";
-  LS.set("vc_cfg", cfg); showSetup();
+  const newCam = $("optCam").value; const camChanged = newCam !== (cfg.camId || ""); cfg.camId = newCam;
+  LS.set("vc_cfg", cfg);
+  if (camChanged) startCamera().then(() => { drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
+  showSetup();
 };
 $("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, hourly: {}, events: [] }; LS.set("vc_data", data); renderCounts(); $("logBox").value = csvText(); } };
 $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
