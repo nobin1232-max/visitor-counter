@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>来場者カウンター（頭上カメラ用）</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+    font-family: -apple-system, "Hiragino Sans", sans-serif; overscroll-behavior: none; }
+  #app { position: fixed; inset: 0; display: flex; flex-direction: column; }
+  .stage { position: relative; flex: 1; background: #111; overflow: hidden; }
+  video, canvas.overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  canvas.overlay { touch-action: none; }
+  .bar { padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); background: #161616;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 10px;
+    padding: 10px 14px; font-size: 15px; }
+  button.primary { background: #0a84ff; border-color: #0a84ff; color: #fff; }
+  button.warn { background: #3a1f1f; border-color: #6a2a2a; }
+  select, input { background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 8px; padding: 8px; font-size: 15px; }
+  .hint { position: absolute; left: 10px; right: 10px; top: 10px; background: rgba(0,0,0,.6);
+    padding: 8px 10px; border-radius: 8px; font-size: 14px; line-height: 1.5; }
+  #run { display: none; }
+  .counters { display: flex; justify-content: space-around; padding: 18px 0 6px; }
+  .c { text-align: center; }
+  .c .n { font-size: 64px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .c .l { font-size: 14px; color: #aaa; margin-top: 6px; }
+  .c.in .n { color: #4cd964; } .c.out .n { color: #ff9f0a; }
+  .status { font-size: 12px; color: #888; padding: 0 12px 8px; line-height: 1.6; }
+  #dim { position: fixed; inset: 0; background: #000; display: none; z-index: 50; }
+  #dim .mini { position: absolute; bottom: 24px; left: 0; right: 0; text-align: center; color: #333; font-size: 28px; font-variant-numeric: tabular-nums; }
+  #settings { display: none; padding: 12px; overflow: auto; flex: 1; background: #0c0c0c; }
+  #settings label { display: block; margin: 12px 0 4px; color: #bbb; font-size: 14px; }
+  #settings input[type=text], #settings input[type=url] { width: 100%; }
+  textarea { width: 100%; height: 160px; background: #1a1a1a; color: #ddd; border: 1px solid #444; border-radius: 8px; font-size: 12px; }
+  .small { font-size: 12px; color: #888; }
+  #live { position: absolute; right: 10px; top: 10px; width: 10px; height: 10px; border-radius: 50%; background: #333; }
+  #live.on { background: #4cd964; box-shadow: 0 0 8px #4cd964; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay" class="overlay"></canvas>
+    <div class="hint" id="hint">カメラ起動中…</div>
+    <div id="live"></div>
+  </div>
+
+  <!-- 設定モードのバー -->
+  <div class="bar" id="setupBar">
+    <button id="btnFlip">入退場を反転</button>
+    <button id="btnClear">引き直す</button>
+    <button id="btnSettings">詳細設定</button>
+    <button class="primary" id="btnStart">計測開始</button>
+  </div>
+
+  <!-- 計測モード -->
+  <div id="run">
+    <div class="counters">
+      <div class="c in"><div class="n" id="nIn">0</div><div class="l">入場</div></div>
+      <div class="c out"><div class="n" id="nOut">0</div><div class="l">退場</div></div>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="bar">
+      <button id="btnDim">画面を暗く</button>
+      <button id="btnRelearn">背景を学習し直す</button>
+      <button id="btnPause">一時停止</button>
+      <button id="btnCsv">CSV/共有</button>
+      <button id="btnSend">今すぐ送信</button>
+      <button id="btnStop">設定に戻る</button>
+    </div>
+  </div>
+
+  <!-- 詳細設定 -->
+  <div id="settings">
+    <h3 style="margin:4px 0">詳細設定</h3>
+    <label>処理コマ数（毎秒）<span class="small">　少ないほど発熱が小さい。3〜5推奨</span></label>
+    <select id="optFps"><option value="5">5</option><option value="8" selected>8</option><option value="12">12</option></select>
+    <label>検出感度<span class="small">　影や照明の揺れを拾うなら「低」、人を見逃すなら「高」</span></label>
+    <select id="optSens"><option value="35">低</option><option value="25" selected>標準</option><option value="16">高</option></select>
+    <label>人として扱う最小の大きさ<span class="small">　画面に占める割合。カメラが高いほど小さく</span></label>
+    <select id="optMin"><option value="0.3">小（0.3%）</option><option value="0.6" selected>標準（0.6%）</option><option value="1.2">大（1.2%）</option><option value="2.5">特大（2.5%）</option></select>
+    <label>大きな塊を複数人として数える<span class="small">　横並びで通る人が多い入口ならオン</span></label>
+    <select id="optSplit"><option value="1" selected>する</option><option value="0">しない</option></select>
+    <label>Google Apps Script のURL（自動送信。空欄なら送信しない）</label>
+    <input type="url" id="optUrl" placeholder="https://script.google.com/macros/s/.../exec">
+    <label>合言葉（gas_receiver.gs の TOKEN）</label>
+    <input type="text" id="optToken">
+    <label>送信間隔（分）</label>
+    <select id="optInterval"><option value="5" selected>5</option><option value="10">10</option><option value="30">30</option></select>
+    <label>使うカメラ<span class="small">　iPhoneは「背面」推奨。Macで試すときは FaceTime HD を選ぶ</span></label>
+    <select id="optCam"><option value="">自動（背面カメラ）</option></select>
+    <label>この端末の名前（複数入口があるとき）</label>
+    <input type="text" id="optName" value="入口1">
+    <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap">
+      <button class="primary" id="btnSaveSettings">保存して戻る</button>
+      <button class="warn" id="btnReset">カウントを全消去</button>
+    </div>
+    <h4>記録（通過ログ）</h4>
+    <textarea id="logBox" readonly></textarea>
+  </div>
+</div>
+
+<div id="dim"><div class="mini" id="miniCount">0 / 0</div></div>
+
+<script type="module">
+// 頭上カメラ専用版: AIモデルを使わず、背景差分で「動く塊」を追跡する（通信不要・軽量）
+
+// ---------------------------------------------------------------- 状態
+const $ = (id) => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+const LS = {
+  get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+let cfg = LS.get("vc_cfg_oh", { line: null, flip: false, fps: 8, sens: 25, minPct: 0.6, split: true,
+  url: "", token: "", interval: 5, name: "入口1", camId: "" });
+let data = LS.get("vc_data_oh", { totalIn: 0, totalOut: 0, hourly: {}, events: [] });
+let mode = "setup";          // setup | run | settings
+let detector = null, stream = null, timer = null, wakeLock = null;
+let tracks = new Map(), nextId = 1, lastSendAt = 0, paused = false;
+let vw = 0, vh = 0, lastTs = -1, inferMs = 0, skipped = 0, processed = 0, lastMotionAt = 0;
+let motionPrev = null;
+const mc = document.createElement("canvas"); mc.width = 64; mc.height = 36; const mctx = mc.getContext("2d", { willReadFrequently: true });
+
+// ---------------------------------------------------------------- 幾何
+const side = (p, a, b) => (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+const ccw = (u, v, w) => (w.y - u.y) * (v.x - u.x) > (v.y - u.y) * (w.x - u.x);
+const intersects = (p1, p2, a, b) => ccw(p1, a, b) !== ccw(p2, a, b) && ccw(p1, p2, a) !== ccw(p1, p2, b);
+function extLine() {
+  const [a, b] = cfg.line; const f = 0.15;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  return [{ x: a.x - dx * f, y: a.y - dy * f }, { x: b.x + dx * f, y: b.y + dy * f }];
+}
+
+// ---------------------------------------------------------------- カメラ・モデル
+async function startCamera() {
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  const vc = { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15, max: 30 } };
+  if (cfg.camId) vc.deviceId = { exact: cfg.camId }; else vc.facingMode = "environment";
+  try { stream = await navigator.mediaDevices.getUserMedia({ video: vc, audio: false }); }
+  catch (e) { cfg.camId = ""; stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false }); }
+  video.srcObject = stream;
+  await new Promise((r) => (video.onloadedmetadata = r));
+  await video.play();
+  vw = video.videoWidth; vh = video.videoHeight;
+  overlay.width = vw; overlay.height = vh;
+}
+// ---------------------------------------------------------------- 背景差分による塊検出
+const BW = 160; let BH = 90;
+const bcv = document.createElement("canvas"); const bctx = bcv.getContext("2d", { willReadFrequently: true });
+let bg = null, gray = null, fg = null, fg2 = null, lab = null, absorb = null, typicalArea = 0, fgRatio = 0, highFgSince = 0;
+async function loadModel() {
+  BH = Math.max(40, Math.round(BW * vh / vw)); bcv.width = BW; bcv.height = BH;
+  gray = new Float32Array(BW * BH); fg = new Uint8Array(BW * BH); absorb = new Uint8Array(BW * BH); fg2 = new Uint8Array(BW * BH); lab = new Int32Array(BW * BH);
+  bg = null; typicalArea = 0; detector = { ready: true };
+}
+function relearnBackground() { bg = null; tracks.clear(); }
+function detectBlobs() {
+  bctx.drawImage(video, 0, 0, BW, BH);
+  const d = bctx.getImageData(0, 0, BW, BH).data; const N = BW * BH;
+  for (let i = 0, j = 0; i < N; i++, j += 4) gray[i] = (d[j] * 0.299 + d[j + 1] * 0.587 + d[j + 2] * 0.114);
+  if (!bg) { bg = Float32Array.from(gray); return []; }
+  const th = cfg.sens; let fgCount = 0;
+  for (let i = 0; i < N; i++) {
+    const diff = Math.abs(gray[i] - bg[i]);
+    if (diff > th) { fg[i] = 1; fgCount++; bg[i] += (gray[i] - bg[i]) * (absorb[i] ? 0.15 : 0.002); }   // 動かない塊（置き物・背景の作り直し残り）は速く吸収
+    else { fg[i] = 0; bg[i] += (gray[i] - bg[i]) * 0.05; }                            // 照明変化には素早く追従
+  }
+  fgRatio = fgCount / N;
+  // カメラが動いた・照明が激変した → 数秒続いたら背景を作り直す
+  if (fgRatio > 0.6) { if (!highFgSince) highFgSince = Date.now(); else if (Date.now() - highFgSince > 4000) { relearnBackground(); highFgSince = 0; return []; } }
+  else highFgSince = 0;
+  // ノイズ除去（3x3で4画素以上）→ 膨張（隙間をつなぐ）
+  for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
+    let c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < BH && xx >= 0 && xx < BW && fg[yy * BW + xx]) c++; }
+    fg2[y * BW + x] = c >= 4 ? 1 : 0;
+  }
+  for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
+    if (fg2[y * BW + x]) { fg[y * BW + x] = 1; continue; }
+    let any = 0;
+    for (let dy = -2; dy <= 2 && !any; dy++) for (let dx = -2; dx <= 2; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < BH && xx >= 0 && xx < BW && fg2[yy * BW + xx]) { any = 1; break; } }
+    fg[y * BW + x] = any;
+  }
+  // 連結成分
+  lab.fill(0); const blobs = []; const stack = []; let id = 0;
+  for (let s0 = 0; s0 < N; s0++) {
+    if (!fg[s0] || lab[s0]) continue;
+    id++; let area = 0, sx = 0, sy = 0, x0 = BW, y0 = BH, x1 = 0, y1 = 0; const px = [];
+    stack.push(s0); lab[s0] = id;
+    while (stack.length) {
+      const p = stack.pop(); const x = p % BW, y = (p / BW) | 0;
+      area++; sx += x; sy += y; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; px.push(p);
+      if (x > 0 && fg[p - 1] && !lab[p - 1]) { lab[p - 1] = id; stack.push(p - 1); }
+      if (x < BW - 1 && fg[p + 1] && !lab[p + 1]) { lab[p + 1] = id; stack.push(p + 1); }
+      if (y > 0 && fg[p - BW] && !lab[p - BW]) { lab[p - BW] = id; stack.push(p - BW); }
+      if (y < BH - 1 && fg[p + BW] && !lab[p + BW]) { lab[p + BW] = id; stack.push(p + BW); }
+    }
+    if (area >= N * cfg.minPct / 100) blobs.push({ area, cx: sx / area, cy: sy / area, x0, y0, x1, y1, px });
+  }
+  // 1人の典型サイズを学習し、大きすぎる塊は複数人に分割
+  const out = [];
+  for (const b of blobs) {
+    let k = 1;
+    const bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1, aspect = Math.max(bw, bh) / Math.min(bw, bh);
+    b.edge = b.x0 <= 1 || b.y0 <= 1 || b.x1 >= BW - 2 || b.y1 >= BH - 2; b.aspect = aspect;
+    // 分割は「典型サイズの1.8倍以上」かつ「細長い（横並び）」ときだけ
+    if (cfg.split && typicalArea > 0 && b.area > typicalArea * 1.8 && aspect >= 1.6) k = Math.min(3, Math.max(2, Math.round(b.area / typicalArea)));
+    if (k <= 1) {
+      out.push(b);
+    } else {
+      const horiz = (b.x1 - b.x0) >= (b.y1 - b.y0);
+      const lo = horiz ? b.x0 : b.y0, hi = (horiz ? b.x1 : b.y1) + 1, w = (hi - lo) / k;
+      const parts = Array.from({ length: k }, () => ({ area: 0, sx: 0, sy: 0, x0: BW, y0: BH, x1: 0, y1: 0 }));
+      for (const p of b.px) { const x = p % BW, y = (p / BW) | 0; const idx = Math.min(k - 1, Math.floor(((horiz ? x : y) - lo) / w)); const q = parts[idx];
+        q.area++; q.sx += x; q.sy += y; if (x < q.x0) q.x0 = x; if (x > q.x1) q.x1 = x; if (y < q.y0) q.y0 = y; if (y > q.y1) q.y1 = y; }
+      for (const q of parts) if (q.area > 0) out.push({ area: q.area, cx: q.sx / q.area, cy: q.sy / q.area, x0: q.x0, y0: q.y0, x1: q.x1, y1: q.y1 });
+    }
+  }
+  const kx = vw / BW, ky = vh / BH;
+  return out.map((b) => ({ x: b.cx * kx, y: b.cy * ky, area: b.area, edge: !!b.edge, aspect: b.aspect || 1, bb: { originX: b.x0 * kx, originY: b.y0 * ky, width: (b.x1 - b.x0 + 1) * kx, height: (b.y1 - b.y0 + 1) * ky } }));
+}
+
+// ---------------------------------------------------------------- 設定モード（ライン引き）
+let tmpPts = [];
+function overlayPoint(ev) {
+  const r = overlay.getBoundingClientRect();
+  // object-fit: contain の余白を考慮して動画座標に変換
+  const scale = Math.min(r.width / vw, r.height / vh);
+  const ox = (r.width - vw * scale) / 2, oy = (r.height - vh * scale) / 2;
+  const x = (ev.clientX - r.left - ox) / scale, y = (ev.clientY - r.top - oy) / scale;
+  return { x: Math.max(0, Math.min(vw, x)), y: Math.max(0, Math.min(vh, y)) };
+}
+overlay.addEventListener("pointerdown", (ev) => {
+  if (mode !== "setup") return;
+  if (tmpPts.length >= 2) tmpPts = [];
+  tmpPts.push(overlayPoint(ev));
+  if (tmpPts.length === 2) { cfg.line = tmpPts.slice(); LS.set("vc_cfg_oh", cfg); }
+  drawSetup();
+});
+function drawSetup() {
+  ctx.clearRect(0, 0, vw, vh);
+  const pts = tmpPts.length ? tmpPts : (cfg.line || []);
+  ctx.fillStyle = "#ff3b30";
+  pts.forEach((p) => { ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill(); });
+  if (pts.length === 2) drawLine(pts, true);
+  $("hint").textContent = pts.length === 2
+    ? "赤線＝検知ライン。緑矢印が「入場」の向き。逆なら「入退場を反転」。よければ「計測開始」"
+    : "頭上カメラ用（通信不要）。来場者が必ず通る場所を横切るように、画面を2回タップしてラインを引いてください";
+}
+function drawLine(pts, arrow) {
+  const [a, b] = pts;
+  ctx.strokeStyle = "#ff3b30"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  if (!arrow) return;
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy) || 1;
+  let nx = -dy / L, ny = dx / L; if (cfg.flip) { nx = -nx; ny = -ny; }
+  const R = Math.max(40, vw * 0.08);
+  const tip = { x: mx + nx * R, y: my + ny * R }, tail = { x: mx - nx * R, y: my - ny * R };
+  ctx.strokeStyle = "#4cd964"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(tail.x, tail.y); ctx.lineTo(tip.x, tip.y); ctx.stroke();
+  // 矢じり
+  const ang = Math.atan2(ny, nx);
+  ctx.beginPath(); ctx.moveTo(tip.x, tip.y);
+  ctx.lineTo(tip.x - 14 * Math.cos(ang - 0.5), tip.y - 14 * Math.sin(ang - 0.5));
+  ctx.moveTo(tip.x, tip.y);
+  ctx.lineTo(tip.x - 14 * Math.cos(ang + 0.5), tip.y - 14 * Math.sin(ang + 0.5)); ctx.stroke();
+  ctx.font = `bold ${Math.max(18, vw * 0.03)}px sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,.7)";
+  const lp = { x: tip.x + nx * 24, y: tip.y + ny * 24 }, lq = { x: tail.x - nx * 24, y: tail.y - ny * 24 };
+  ctx.strokeText("入場", lp.x, lp.y); ctx.fillStyle = "#4cd964"; ctx.fillText("入場", lp.x, lp.y);
+  ctx.strokeText("退場", lq.x, lq.y); ctx.fillStyle = "#ff9f0a"; ctx.fillText("退場", lq.x, lq.y);
+  ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
+}
+$("btnFlip").onclick = () => { cfg.flip = !cfg.flip; LS.set("vc_cfg_oh", cfg); drawSetup(); };
+$("btnClear").onclick = () => { tmpPts = []; cfg.line = null; LS.set("vc_cfg_oh", cfg); drawSetup(); };
+
+// ---------------------------------------------------------------- 計測ループ
+function anchorOf(bb) {
+  return cfg.anchor === "bottom" ? { x: bb.originX + bb.width / 2, y: bb.originY + bb.height }
+                                  : { x: bb.originX + bb.width / 2, y: bb.originY + bb.height / 2 };
+}
+function hasMotion() {
+  mctx.drawImage(video, 0, 0, 64, 36);
+  const d = mctx.getImageData(0, 0, 64, 36).data;
+  if (!motionPrev) { motionPrev = new Uint8ClampedArray(d); return true; }
+  let changed = 0;
+  for (let i = 0; i < d.length; i += 4) if (Math.abs(d[i] - motionPrev[i]) + Math.abs(d[i + 1] - motionPrev[i + 1]) + Math.abs(d[i + 2] - motionPrev[i + 2]) > 40) changed++;
+  motionPrev.set(d);
+  return changed > (d.length / 4) * 0.004;  // 画面の0.4%以上の画素が変化したら「動きあり」
+}
+function associate(dets, now) {
+  // 単純な最近傍対応づけ
+  const maxDist = vw * 0.22;
+  const used = new Set(), result = [];
+  const cand = [];
+  for (const [id, t] of tracks) for (let i = 0; i < dets.length; i++) {
+    const d = Math.hypot(dets[i].x - t.pt.x, dets[i].y - t.pt.y);
+    if (d < maxDist) cand.push({ id, i, d });
+  }
+  cand.sort((p, q) => p.d - q.d);
+  const matchedT = new Set();
+  for (const c of cand) {
+    if (used.has(c.i) || matchedT.has(c.id)) continue;
+    used.add(c.i); matchedT.add(c.id); result.push({ id: c.id, det: dets[c.i] });
+  }
+  dets.forEach((d, i) => { if (!used.has(i)) { const id = nextId++; tracks.set(id, { pt: d, lastSide: null, far: 0, seen: now, counted: [] }); result.push({ id, det: d, fresh: true }); } });
+  for (const [id, t] of tracks) if (now - t.seen > 2000) tracks.delete(id);
+  return result;
+}
+function updateTrack(id, pt, now) {
+  const t = tracks.get(id); const [a, b] = extLine();
+  const s = side(pt, a, b);
+  const L = Math.hypot(b.x - a.x, b.y - a.y);
+  let dir = null;
+  if (t.lastSide !== null && t.lastSide !== 0 && (s > 0) !== (t.lastSide > 0)) {
+    t.far = Math.max(t.far, Math.abs(t.lastSide));
+    if (t.far / L >= Math.max(8, vw * 0.015) && intersects(t.pt, pt, a, b)) {
+      dir = s > 0 ? "in" : "out"; if (cfg.flip) dir = dir === "in" ? "out" : "in";
+      if (t.counted.length && t.counted[t.counted.length - 1] === dir) dir = null; else t.counted.push(dir);
+    }
+    t.far = 0;
+  } else t.far = Math.max(t.far, Math.abs(s));
+  t.pt = pt; t.lastSide = s; t.seen = now;
+  return dir;
+}
+function record(dir) {
+  const d = new Date();
+  const hour = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
+  data.hourly[hour] = data.hourly[hour] || { in: 0, out: 0 };
+  data.hourly[hour][dir]++;
+  if (dir === "in") data.totalIn++; else data.totalOut++;
+  data.events.push([d.toISOString(), dir]);
+  if (data.events.length > 5000) data.events.splice(0, data.events.length - 5000);
+  LS.set("vc_data_oh", data);
+  renderCounts();
+}
+function renderCounts() {
+  $("nIn").textContent = data.totalIn; $("nOut").textContent = data.totalOut;
+  $("miniCount").textContent = `${data.totalIn} / ${data.totalOut}`;
+}
+async function tick() {
+  if (mode !== "run" || paused || !detector || video.readyState < 2) return;
+  const now = performance.now();
+  const t0 = performance.now();
+  const dets = detectBlobs();
+  inferMs = inferMs * 0.9 + (performance.now() - t0) * 0.1; processed++;
+  const matched = associate(dets, Date.now());
+  ctx.clearRect(0, 0, vw, vh); drawLine(cfg.line, false);
+  absorb.fill(0);
+  for (const m of matched) {
+    const t = tracks.get(m.id);
+    if (!t.origin) { t.origin = { x: m.det.x, y: m.det.y }; t.born = Date.now(); t.lastMove = Date.now(); t.movePt = { x: m.det.x, y: m.det.y }; }
+    const moved = Math.hypot(m.det.x - t.origin.x, m.det.y - t.origin.y);
+    if (Math.hypot(m.det.x - t.movePt.x, m.det.y - t.movePt.y) > vw * 0.03) { t.movePt = { x: m.det.x, y: m.det.y }; t.lastMove = Date.now(); }
+    // 典型サイズ: 明らかに移動していて、端にかかっておらず、細長くない塊から学習
+    if (m.det.area && moved > vw * 0.08 && !m.det.edge && m.det.aspect < 1.5)
+      typicalArea = !typicalArea ? m.det.area : (m.det.area > typicalArea ? typicalArea + (m.det.area - typicalArea) * 0.2 : typicalArea + (m.det.area - typicalArea) * 0.03);
+    // 3秒以上動いていない塊は背景に吸収させる（置き物・背景の作り直し残り）
+    if (Date.now() - t.lastMove > 3000) {
+      const bb = m.det.bb, kx = BW / vw, ky = BH / vh;
+      const x0 = Math.max(0, Math.floor(bb.originX * kx)), x1 = Math.min(BW - 1, Math.ceil((bb.originX + bb.width) * kx));
+      const y0 = Math.max(0, Math.floor(bb.originY * ky)), y1 = Math.min(BH - 1, Math.ceil((bb.originY + bb.height) * ky));
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) absorb[y * BW + x] = 1;
+    }
+  }
+  for (const m of matched) {
+    const dir = updateTrack(m.id, { x: m.det.x, y: m.det.y }, Date.now());
+    if (window.__vcDebug) (window.__vcLog = window.__vcLog || []).push([window.__lastFi, m.id, Math.round(m.det.x), Math.round(m.det.y), dir]);
+    if (dir) { record(dir); $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600); }
+    const t = tracks.get(m.id); const col = t.counted.length ? "#ff9f0a" : "#4cd964";
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.strokeRect(m.det.bb.originX, m.det.bb.originY, m.det.bb.width, m.det.bb.height);
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(m.det.x, m.det.y, 5, 0, Math.PI * 2); ctx.fill();
+  }
+  if (processed % 10 === 0) renderStatus();
+  if (cfg.url && Date.now() - lastSendAt > cfg.interval * 60000) send();
+}
+function renderStatus() {
+  const s = `${vw}×${vh}  処理 ${inferMs.toFixed(1)}ms/コマ  コマ ${processed}  前景 ${(fgRatio * 100).toFixed(0)}%  追跡中 ${tracks.size}` +
+    (cfg.url ? `  送信 ${lastSendAt ? new Date(lastSendAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "未"}` : "  送信なし（端末内保存）");
+  $("status").textContent = s;
+}
+
+// ---------------------------------------------------------------- 送信・CSV
+function summary() {
+  const today = new Date(); const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const hourly = Object.keys(data.hourly).sort().map((h) => ({ hour: h, in: data.hourly[h].in, out: data.hourly[h].out }));
+  return { mode: "live", device: cfg.name, date, total_in: data.totalIn, total_out: data.totalOut, hourly, videos: [cfg.name], model: "overhead-motion", elapsed_min: "", token: cfg.token };
+}
+async function send() {
+  if (!cfg.url) return;
+  lastSendAt = Date.now();
+  try {
+    await fetch(cfg.url, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain" }, body: JSON.stringify(summary()) });
+  } catch (e) { console.warn("send failed", e); }
+  renderStatus();
+}
+function csvText() {
+  let t = "﻿時間帯,入場,退場\n";
+  for (const h of Object.keys(data.hourly).sort()) t += `${h},${data.hourly[h].in},${data.hourly[h].out}\n`;
+  t += `合計,${data.totalIn},${data.totalOut}\n\n時刻,向き\n`;
+  for (const [ts, dir] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"}\n`;
+  return t;
+}
+$("btnCsv").onclick = async () => {
+  const text = csvText();
+  const file = new File([text], `visitors_${cfg.name}.csv`, { type: "text/csv" });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) { try { await navigator.share({ files: [file], title: "来場者集計" }); return; } catch {} }
+  try { await navigator.clipboard.writeText(text); alert("CSVをクリップボードにコピーしました"); } catch { showSettings(); }
+};
+$("btnSend").onclick = () => { if (!cfg.url) { alert("詳細設定でGASのURLを入れてください"); return; } send(); };
+
+// ---------------------------------------------------------------- モード切替
+async function keepAwake() { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {} }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { keepAwake(); if (video.paused) video.play().catch(() => {}); } });
+function showRun() {
+  LS.set("vc_running_oh", true); relearnBackground();
+  mode = "run"; $("setupBar").style.display = "none"; $("settings").style.display = "none"; $("run").style.display = "block";
+  $("hint").style.display = "none"; renderCounts(); renderStatus(); keepAwake();
+  clearInterval(timer); timer = setInterval(tick, 1000 / cfg.fps);
+}
+function showSetup() {
+  LS.set("vc_running_oh", false);
+  mode = "setup"; clearInterval(timer); $("run").style.display = "none"; $("settings").style.display = "none";
+  $("setupBar").style.display = "flex"; $("hint").style.display = "block"; $("stage").style.display = "block"; tmpPts = []; drawSetup();
+}
+function showSettings() {
+  mode = "settings"; clearInterval(timer); $("run").style.display = "none"; $("setupBar").style.display = "none"; $("stage").style.display = "none";
+  $("settings").style.display = "block";
+  $("optFps").value = cfg.fps; $("optSens").value = cfg.sens; $("optMin").value = cfg.minPct; $("optSplit").value = cfg.split ? "1" : "0";
+  $("optUrl").value = cfg.url; $("optToken").value = cfg.token; $("optInterval").value = cfg.interval; $("optName").value = cfg.name;
+  $("logBox").value = csvText();
+  navigator.mediaDevices.enumerateDevices().then((devs) => {
+    const sel = $("optCam"); sel.innerHTML = '<option value="">自動（背面カメラ）</option>';
+    devs.filter((d) => d.kind === "videoinput").forEach((d, i) => {
+      const o = document.createElement("option"); o.value = d.deviceId; o.textContent = d.label || `カメラ ${i + 1}`; sel.appendChild(o); });
+    sel.value = cfg.camId || "";
+  }).catch(() => {});
+}
+$("btnStart").onclick = () => { if (!cfg.line) { alert("先にラインを引いてください"); return; } showRun(); };
+$("btnStop").onclick = showSetup;
+$("btnSettings").onclick = showSettings;
+$("btnSaveSettings").onclick = () => {
+  cfg.fps = +$("optFps").value; cfg.sens = +$("optSens").value; cfg.minPct = +$("optMin").value; cfg.split = $("optSplit").value === "1";
+  cfg.url = $("optUrl").value.trim(); cfg.token = $("optToken").value.trim(); cfg.interval = +$("optInterval").value; cfg.name = $("optName").value.trim() || "入口1";
+  const newCam = $("optCam").value; const camChanged = newCam !== (cfg.camId || ""); cfg.camId = newCam;
+  LS.set("vc_cfg_oh", cfg);
+  if (camChanged) startCamera().then(() => { loadModel(); drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
+  showSetup();
+};
+$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, hourly: {}, events: [] }; LS.set("vc_data_oh", data); renderCounts(); $("logBox").value = csvText(); } };
+$("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
+$("btnDim").onclick = () => { $("dim").style.display = "block"; };
+$("btnRelearn").onclick = () => { relearnBackground(); };
+$("dim").onclick = () => { $("dim").style.display = "none"; };
+
+// ---------------------------------------------------------------- 起動
+(async () => {
+  try {
+    if (!window.isSecureContext) throw new Error("このページはHTTPSで開く必要があります");
+    await startCamera();
+    drawSetup();
+    await loadModel();
+    renderCounts();
+    // 計測開始時に背景を作り直す（設定中に人が映っていても影響しないように）
+    if (cfg.line) drawSetup();
+    // 直前まで計測中だった場合（再読み込み・復帰）は自動で再開
+    if (LS.get("vc_running_oh", false) && cfg.line) showRun();
+  } catch (e) {
+    $("hint").textContent = "起動できません: " + e.message + "（Safariでカメラを許可してください）";
+    console.error(e);
+  }
+})();
+window.__vc = { get data() { return data; }, get cfg() { return cfg; }, get tracks() { return tracks; }, showRun: () => showRun(), setLine: (l, flip) => { cfg.line = l; cfg.flip = !!flip; LS.set("vc_cfg_oh", cfg); } };
+</script>
+</body>
+</html>
