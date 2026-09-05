@@ -40,6 +40,7 @@
   #settings input[type=text], #settings input[type=url] { width: 100%; }
   textarea { width: 100%; height: 160px; background: #1a1a1a; color: #ddd; border: 1px solid #444; border-radius: 8px; font-size: 12px; }
   .small { font-size: 12px; color: #888; }
+  #rep { font-size: 13px; color: #9ad; padding: 2px 12px 8px; line-height: 1.5; }
   #gap { display: none; margin: 0 12px 8px; padding: 8px 10px; border-radius: 8px;
     background: #3a2a10; border: 1px solid #7a5a20; color: #ffd08a; font-size: 13px; line-height: 1.5; }
   #offline { font-size: 12px; color: #666; padding: 0 12px 10px; }
@@ -70,6 +71,7 @@
       <div class="c in"><div class="n" id="nIn">0</div><div class="l">入場</div></div>
       <div class="c out"><div class="n" id="nOut">0</div><div class="l">退場</div></div>
     </div>
+    <div id="rep"></div>
     <div id="gap"></div>
     <div class="status" id="status"></div>
     <div id="offline"></div>
@@ -102,6 +104,10 @@
     <select id="optInterval"><option value="5" selected>5</option><option value="10">10</option><option value="30">30</option></select>
     <label>使うカメラ<span class="small">　iPhoneは「背面」推奨。Macで試すときは FaceTime HD を選ぶ</span></label>
     <select id="optCam"><option value="">自動（背面カメラ）</option></select>
+    <label>同一人物らしき再通過の照合<span class="small">　この時間内に似た人が再び通ったら印を付ける（数は減らしません）</span></label>
+    <select id="optRepWin"><option value="0">照合しない</option><option value="5">5分以内</option><option value="15" selected>15分以内</option><option value="60">1時間以内</option></select>
+    <label>同一とみなす似ている度<span class="small">　同じ人を別人と数えるなら「ゆるめ」、別人を同一とするなら「厳しめ」</span></label>
+    <select id="optRepTh"><option value="8">厳しめ（取りこぼしても誤りを避ける）</option><option value="11" selected>標準</option><option value="15">ゆるめ（多めに印を付ける）</option></select>
     <label>検証用スナップショット<span class="small">　通過の瞬間を小さな写真で保存（1件約10KB）。あとで見返して検証できます</span></label>
     <select id="optEvid"><option value="1" selected>保存する</option><option value="0">保存しない</option></select>
     <label>定点スナップショット<span class="small">　カメラのズレ確認用。この間隔で1枚ずつ保存</span></label>
@@ -131,8 +137,11 @@ const LS = {
   get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
-let cfg = LS.get("vc_cfg", { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true,
-  url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000 });
+const CFG_DEF = { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true,
+  url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
+// 以前のバージョンで保存した設定に、新しい項目を足して読み込む
+let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg", {}));
+if (![8, 11, 15].includes(cfg.repTh)) cfg.repTh = CFG_DEF.repTh;   // 似ている度の目盛りが変わったため
 let data = LS.get("vc_data", { totalIn: 0, totalOut: 0, hourly: {}, events: [] });
 
 // ---------------------------------------------------------------- オフライン対応
@@ -246,12 +255,13 @@ function keepPrev() {
   prevCv.width = SNAP_W; prevCv.height = h;
   try { prevCx.drawImage(video, 0, 0, SNAP_W, h); prevReady = true; } catch {}
 }
-function evSaveEvent(dir, k, bb) {
+function evSaveEvent(dir, k, bb, rep) {
   if (!cfg.evidence) return;
   const before = prevReady ? prevCv.toDataURL("image/jpeg", 0.5) : null;
   const after = snapNow(bb);
   if (!after) return;
-  evPut({ ts: Date.now(), kind: "count", dir, k: k || 1, before, after });
+  evPut({ ts: Date.now(), kind: "count", dir, k: k || 1, rep: rep ? 1 : 0, repTs: rep ? rep.ts : null,
+          repD: rep ? rep.d : null, repMin: rep ? rep.min : null, repDir: rep ? rep.dir : null, before, after });
 }
 let lastPeriodic = 0;
 function evPeriodic() {
@@ -279,9 +289,10 @@ async function evExport() {
   for (const r of all) {
     const hour = new Date(r.ts).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit" });
     if (hour !== lastHour) { rows += `<h2>${esc(hour)}台</h2>`; lastHour = hour; }
-    const label = r.kind === "periodic" ? "定点" : (r.dir === "in" ? "入場" : "退場") + (r.k > 1 ? ` ×${r.k}` : "");
+    let label = r.kind === "periodic" ? "定点" : (r.dir === "in" ? "入場" : "退場") + (r.k > 1 ? ` ×${r.k}` : "");
+    if (r.rep) label += `　<span class="rep">同じ人かも: ${r.repMin || "?"}分前に${r.repDir === "in" ? "入った" : "出た"}人と似ています（${esc(jp(r.repTs))} ／ 似ている度 ${r.repD}）</span>`;
     const cls = r.kind === "periodic" ? "p" : (r.dir === "in" ? "in" : "out");
-    rows += `<div class="c ${cls}"><div class="t">${esc(jp(r.ts))}　<b>${esc(label)}</b></div><div class="i">` +
+    rows += `<div class="c ${cls}"><div class="t">${esc(jp(r.ts))}　<b>${label}</b></div><div class="i">` +
       (r.before ? `<figure><img src="${r.before}"><figcaption>前</figcaption></figure>` : "") +
       `<figure><img src="${r.after}"><figcaption>${r.kind === "periodic" ? "定点" : "通過時"}</figcaption></figure></div></div>`;
   }
@@ -295,12 +306,13 @@ h1{font-size:20px}h2{font-size:15px;color:#9cf;border-bottom:1px solid #333;padd
 .c.in{border-left-color:#4cd964}.c.out{border-left-color:#ff9f0a}.c.p{border-left-color:#456}
 .t{font-size:13px;color:#bbb;margin-bottom:6px}.i{display:flex;gap:8px;flex-wrap:wrap}
 figure{margin:0}figcaption{font-size:11px;color:#888;text-align:center}img{width:260px;max-width:44vw;border-radius:4px;display:block}
-.sum{background:#1b2b1b;padding:10px;border-radius:8px;font-size:14px;line-height:1.7}</style></head><body>
+.rep{color:#ffd08a;font-weight:normal;font-size:12px}.sum{background:#1b2b1b;padding:10px;border-radius:8px;font-size:14px;line-height:1.7}</style></head><body>
 <h1>来場者カウント 検証記録</h1>
 <div class="sum">端末: ${esc(cfg.name)}／書き出し: ${esc(jp(Date.now()))}<br>
 記録件数: ${all.length}件（うち通過 ${all.filter((r) => r.kind === "count").length}件、定点 ${all.filter((r) => r.kind === "periodic").length}件）<br>
 写真から数えた合計: 入場 ${nIn} ／ 退場 ${nOut}<br>
-アプリの累計: 入場 ${data.totalIn} ／ 退場 ${data.totalOut}</div>
+アプリの累計: 入場 ${data.totalIn} ／ 退場 ${data.totalOut}<br>
+同一人物らしき再通過: ${all.filter((r) => r.rep).length}件（この記録内）</div>
 ${rows}</body></html>`;
   const file = new File([html], `検証記録_${cfg.name}_${new Date().toISOString().slice(0, 10)}.html`, { type: "text/html" });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
@@ -313,6 +325,92 @@ ${rows}</body></html>`;
 // 保存領域をiOSに消されにくくする
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 evRefreshCount();
+
+// ---------------------------------------------------------------- 同一人物らしき再通過の照合
+// 服の色（色相・彩度）の分布を上半身・下半身べつべつに記録し、直近に「逆向き」に通った人と照合する。
+// 1回の通過で数コマぶん取り、いちばん似ている組で判定する。
+// 自動では引き算しない。印を付けるだけで、あとで写真を見て判断できるようにする。
+const SIGW = 16, SIGH = 32;
+const sigCv = document.createElement("canvas"); sigCv.width = SIGW; sigCv.height = SIGH;
+const sigCx = sigCv.getContext("2d", { willReadFrequently: true });
+let recentSigs = [];   // { ts, dir, sigs:[Float32Array] }
+function makeSig(bb) {
+  if (!bb || !vw) return null;
+  const sx = Math.max(0, bb.originX), sy = Math.max(0, bb.originY);
+  const sw = Math.min(vw - sx, bb.width), sh = Math.min(vh - sy, bb.height);
+  if (sw < 10 || sh < 16) return null;
+  let d;
+  try { sigCx.drawImage(video, sx, sy, sw, sh, 0, 0, SIGW, SIGH); d = sigCx.getImageData(0, 0, SIGW, SIGH).data; }
+  catch { return null; }
+  const h = new Float32Array(64);   // 上半身 8色相×4彩度 ＋ 下半身 8色相×4彩度
+  for (let y = 0; y < SIGH; y++) {
+    const half = y < SIGH / 2 ? 0 : 32;
+    for (let x = 0; x < SIGW; x++) {
+      const i = (y * SIGW + x) * 4, r = d[i], g = d[i + 1], b = d[i + 2];
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b), c = mx - mn;
+      let hue = 0;
+      if (c > 0) {
+        if (mx === r) hue = 30 * (((g - b) / c) % 6);
+        else if (mx === g) hue = 30 * ((b - r) / c + 2);
+        else hue = 30 * ((r - g) / c + 4);
+        if (hue < 0) hue += 180;
+      }
+      const sat = mx > 0 ? c * 255 / mx : 0;
+      // 色の区切りをなめらかに（境目でガラッと変わらないよう、隣の枠にも分けて入れる）
+      const hp = hue / 22.5 - 0.5, sp = sat / 64 - 0.5;
+      const hi = Math.floor(hp), si = Math.floor(sp), hf = hp - hi, sf = sp - si;
+      for (let dh = 0; dh < 2; dh++) for (let ds = 0; ds < 2; ds++) {
+        const hb = ((dh ? hi + 1 : hi) % 8 + 8) % 8, sb = Math.max(0, Math.min(3, ds ? si + 1 : si));
+        h[half + hb * 4 + sb] += (dh ? hf : 1 - hf) * (ds ? sf : 1 - sf);
+      }
+    }
+  }
+  for (const off of [0, 32]) {   // 上下それぞれの大きさをそろえる
+    let n = 0; for (let i = off; i < off + 32; i++) n += h[i] * h[i];
+    n = Math.sqrt(n) || 1; for (let i = off; i < off + 32; i++) h[i] /= n;
+  }
+  return h;
+}
+// 0（そっくり）〜1（似ていない）。色の分布どうしの距離（Bhattacharyya）
+function sigDist(a, b) {
+  let s1 = 0, s2 = 0, s = 0;
+  for (let i = 0; i < a.length; i++) { s1 += a[i]; s2 += b[i]; s += Math.sqrt(a[i] * b[i]); }
+  const den = Math.sqrt((s1 / a.length) * (s2 / a.length)) * a.length;
+  return den > 0 ? Math.sqrt(Math.max(0, 1 - s / den)) : 1;
+}
+if (window.__vcDebug) window.__vcSig = { makeSig, sigDist, checkRepeat, get recent() { return recentSigs; } };
+function collectSig(t, bb) {
+  if (!cfg.repWin || !t) return;
+  if (!t.sigs) t.sigs = [];
+  if (t.sigs.length >= 6 || (t.sigN = (t.sigN || 0) + 1) % 2) return;
+  const s = makeSig(bb); if (s) t.sigs.push(s);
+}
+function checkRepeat(sigs, dir, ts) {
+  if (!cfg.repWin) return null;
+  let best = null, bd = 1;
+  if (sigs && sigs.length) {
+    for (const r of recentSigs) {
+      if (ts - r.ts > cfg.repWin * 60000) continue;
+      if (r.dir === dir) continue;   // 「入った人」は「前に出た人」とだけ照合する
+      for (const a of sigs) for (const b of r.sigs) { const d = sigDist(a, b); if (d < bd) { bd = d; best = r; } }
+    }
+  }
+  const hit = (best && bd <= cfg.repTh / 100) ? {
+    ts: best.ts, dir: best.dir, d: bd.toFixed(2),
+    min: Math.max(1, Math.round((ts - best.ts) / 60000)),
+  } : null;
+  if (sigs && sigs.length) {
+    recentSigs.push({ ts, dir, sigs });
+    if (recentSigs.length > 120) recentSigs.splice(0, recentSigs.length - 120);
+  }
+  return hit;
+}
+function repText() {
+  const r = (data.repIn || 0) + (data.repOut || 0);
+  if (!cfg.repWin) return "";
+  if (!r) return "同一人物らしき再通過: 0件";
+  return `同一人物らしき再通過: ${r}件（入場${data.repIn || 0}・退場${data.repOut || 0}）　→ 除いた推定: 入場 ${data.totalIn - (data.repIn || 0)} ／ 退場 ${data.totalOut - (data.repOut || 0)}`;
+}
 
 let mode = "setup";          // setup | run | settings
 let detector = null, stream = null, timer = null, wakeLock = null;
@@ -435,7 +533,7 @@ function associate(dets, now) {
     if (used.has(c.i) || matchedT.has(c.id)) continue;
     used.add(c.i); matchedT.add(c.id); result.push({ id: c.id, det: dets[c.i] });
   }
-  dets.forEach((d, i) => { if (!used.has(i)) { const id = nextId++; tracks.set(id, { pt: d, lastSide: null, far: 0, seen: now, counted: [] }); result.push({ id, det: d, fresh: true }); } });
+  dets.forEach((d, i) => { if (!used.has(i)) { const id = nextId++; tracks.set(id, { pt: d, lastSide: null, far: 0, seen: now, counted: [], sigs: [] }); result.push({ id, det: d, fresh: true }); } });
   for (const [id, t] of tracks) if (now - t.seen > 2000) tracks.delete(id);
   return result;
 }
@@ -455,13 +553,14 @@ function updateTrack(id, pt, now) {
   t.pt = pt; t.lastSide = s; t.seen = now;
   return dir;
 }
-function record(dir) {
+function record(dir, rep) {
   const d = new Date();
+  if (rep) { if (dir === "in") data.repIn = (data.repIn || 0) + 1; else data.repOut = (data.repOut || 0) + 1; }
   const hour = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
   data.hourly[hour] = data.hourly[hour] || { in: 0, out: 0 };
   data.hourly[hour][dir]++;
   if (dir === "in") data.totalIn++; else data.totalOut++;
-  data.events.push([d.toISOString(), dir]);
+  data.events.push([d.toISOString(), dir, rep ? 1 : 0]);
   if (data.events.length > 5000) data.events.splice(0, data.events.length - 5000);
   LS.set("vc_data", data);
   renderCounts();
@@ -469,6 +568,7 @@ function record(dir) {
 function renderCounts() {
   $("nIn").textContent = data.totalIn; $("nOut").textContent = data.totalOut;
   $("miniCount").textContent = `${data.totalIn} / ${data.totalOut}`;
+  if ($("rep")) $("rep").textContent = repText();
 }
 async function tick() {
   if (mode !== "run" || paused || !detector || video.readyState < 2) return;
@@ -485,9 +585,10 @@ async function tick() {
   const matched = associate(dets, Date.now());
   ctx.clearRect(0, 0, vw, vh); drawLine(cfg.line, false);
   for (const m of matched) {
+    collectSig(tracks.get(m.id), m.det.bb);
     const dir = updateTrack(m.id, { x: m.det.x, y: m.det.y }, Date.now());
     if (window.__vcDebug) (window.__vcLog = window.__vcLog || []).push([window.__lastFi, m.id, Math.round(m.det.x), Math.round(m.det.y), dir]);
-    if (dir) { record(dir); evSaveEvent(dir, 1, m.det.bb); $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600); }
+    if (dir) { const rep = checkRepeat(tracks.get(m.id).sigs, dir, Date.now()); record(dir, rep); evSaveEvent(dir, 1, m.det.bb, rep); $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600); }
     const t = tracks.get(m.id); const col = t.counted.length ? "#ff9f0a" : "#4cd964";
     ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.strokeRect(m.det.bb.originX, m.det.bb.originY, m.det.bb.width, m.det.bb.height);
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(m.det.x, m.det.y, 5, 0, Math.PI * 2); ctx.fill();
@@ -520,8 +621,10 @@ async function send() {
 function csvText() {
   let t = "﻿時間帯,入場,退場\n";
   for (const h of Object.keys(data.hourly).sort()) t += `${h},${data.hourly[h].in},${data.hourly[h].out}\n`;
-  t += `合計,${data.totalIn},${data.totalOut}\n\n時刻,向き\n`;
-  for (const [ts, dir] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"}\n`;
+  t += `合計,${data.totalIn},${data.totalOut}\n`;
+  t += `同一人物らしき再通過,${data.repIn || 0},${data.repOut || 0}\n`;
+  t += `再通過を除いた推定,${data.totalIn - (data.repIn || 0)},${data.totalOut - (data.repOut || 0)}\n\n時刻,向き,同一人物らしき\n`;
+  for (const [ts, dir, rep] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"},${rep ? "○" : ""}\n`;
   if (gaps.length) {
     t += `\n計測が止まっていた時間,長さ(秒)\n`;
     for (const [ts, sec] of gaps) t += `${new Date(ts).toLocaleString("ja-JP")},${sec}\n`;
@@ -564,6 +667,7 @@ function showSettings() {
   mode = "settings"; clearInterval(timer); $("run").style.display = "none"; $("setupBar").style.display = "none"; $("stage").style.display = "none";
   $("settings").style.display = "block";
   $("optFps").value = cfg.fps; $("optConf").value = cfg.conf; $("optAnchor").value = cfg.anchor; $("optMotion").value = cfg.motion ? "1" : "0";
+  $("optRepWin").value = cfg.repWin; $("optRepTh").value = cfg.repTh;
   $("optEvid").value = cfg.evidence ? "1" : "0"; $("optEvEvery").value = cfg.evEvery; $("optEvMax").value = cfg.evMax;
   $("optUrl").value = cfg.url; $("optToken").value = cfg.token; $("optInterval").value = cfg.interval; $("optName").value = cfg.name;
   $("logBox").value = csvText();
@@ -579,6 +683,7 @@ $("btnStop").onclick = showSetup;
 $("btnSettings").onclick = showSettings;
 $("btnSaveSettings").onclick = () => {
   cfg.fps = +$("optFps").value; cfg.conf = +$("optConf").value; cfg.anchor = $("optAnchor").value; cfg.motion = $("optMotion").value === "1";
+  cfg.repWin = +$("optRepWin").value; cfg.repTh = +$("optRepTh").value;
   cfg.evidence = $("optEvid").value === "1"; cfg.evEvery = +$("optEvEvery").value; cfg.evMax = +$("optEvMax").value;
   cfg.url = $("optUrl").value.trim(); cfg.token = $("optToken").value.trim(); cfg.interval = +$("optInterval").value; cfg.name = $("optName").value.trim() || "入口1";
   const newCam = $("optCam").value; const camChanged = newCam !== (cfg.camId || ""); cfg.camId = newCam;
@@ -586,7 +691,7 @@ $("btnSaveSettings").onclick = () => {
   if (camChanged) startCamera().then(() => { drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
   showSetup();
 };
-$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, hourly: {}, events: [] }; LS.set("vc_data", data); gaps = []; LS.set("vc_gaps", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
+$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, hourly: {}, events: [] }; recentSigs = []; LS.set("vc_data", data); gaps = []; LS.set("vc_gaps", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
 $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
 $("btnDim").onclick = () => { $("dim").style.display = "block"; };
 $("dim").onclick = () => { $("dim").style.display = "none"; };
