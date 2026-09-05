@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="apple-touch-icon" href="./icon.png">
 <title>来場者カウンター</title>
 <style>
   :root { color-scheme: dark; }
@@ -38,6 +40,9 @@
   #settings input[type=text], #settings input[type=url] { width: 100%; }
   textarea { width: 100%; height: 160px; background: #1a1a1a; color: #ddd; border: 1px solid #444; border-radius: 8px; font-size: 12px; }
   .small { font-size: 12px; color: #888; }
+  #gap { display: none; margin: 0 12px 8px; padding: 8px 10px; border-radius: 8px;
+    background: #3a2a10; border: 1px solid #7a5a20; color: #ffd08a; font-size: 13px; line-height: 1.5; }
+  #offline { font-size: 12px; color: #666; padding: 0 12px 10px; }
   #live { position: absolute; right: 10px; top: 10px; width: 10px; height: 10px; border-radius: 50%; background: #333; }
   #live.on { background: #4cd964; box-shadow: 0 0 8px #4cd964; }
 </style>
@@ -65,7 +70,9 @@
       <div class="c in"><div class="n" id="nIn">0</div><div class="l">入場</div></div>
       <div class="c out"><div class="n" id="nOut">0</div><div class="l">退場</div></div>
     </div>
+    <div id="gap"></div>
     <div class="status" id="status"></div>
+    <div id="offline"></div>
     <div class="bar">
       <button id="btnDim">画面を暗く</button>
       <button id="btnPause">一時停止</button>
@@ -120,6 +127,46 @@ const LS = {
 let cfg = LS.get("vc_cfg", { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "" });
 let data = LS.get("vc_data", { totalIn: 0, totalOut: 0, hourly: {}, events: [] });
+
+// ---------------------------------------------------------------- オフライン対応
+let swReady = false;
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("./sw.js").then((reg) => {
+    swReady = true;
+    navigator.serviceWorker.addEventListener("message", (e) => {
+      if (e.data && e.data.type === "vc-cache-status") renderOffline(e.data.count);
+    });
+  }).catch(() => {});
+}
+function renderOffline(n) {
+  const el = $("offline"); if (!el) return;
+  el.textContent = n >= 6
+    ? `オフライン準備OK（${n}件を端末内に保存済み。ネットが無くても起動します）`
+    : `オフライン準備中…（Wi-Fiにつないだまま1〜2分お待ちください／保存 ${n || 0}件）`;
+}
+function checkOffline() {
+  if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage("vc-cache-status");
+  } else if ($("offline")) {
+    $("offline").textContent = "オフライン準備: 未（一度オンラインでこのページを開き直してください）";
+  }
+}
+
+// ---------------------------------------------------------------- 中断（画面オフ・他アプリ）の検知
+let hiddenAt = 0;
+let gaps = LS.get("vc_gaps", []);
+function fmtGap(sec) {
+  return sec >= 3600 ? `${Math.round(sec / 360) / 10}時間` : sec >= 60 ? `${Math.round(sec / 60)}分` : `${sec}秒`;
+}
+function showGap() {
+  const el = $("gap"); if (!el) return;
+  if (!gaps.length) { el.style.display = "none"; return; }
+  const last = gaps[gaps.length - 1];
+  const total = gaps.reduce((a, g) => a + g[1], 0);
+  el.style.display = "block";
+  el.textContent = `⚠ 計測が止まっていた時間があります（直近: ${new Date(last[0]).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })} から ${fmtGap(last[1])}／合計 ${gaps.length}回・${fmtGap(total)}）。画面が消えていた可能性があります。`;
+}
+
 let mode = "setup";          // setup | run | settings
 let detector = null, stream = null, timer = null, wakeLock = null;
 let tracks = new Map(), nextId = 1, lastSendAt = 0, paused = false;
@@ -326,6 +373,10 @@ function csvText() {
   for (const h of Object.keys(data.hourly).sort()) t += `${h},${data.hourly[h].in},${data.hourly[h].out}\n`;
   t += `合計,${data.totalIn},${data.totalOut}\n\n時刻,向き\n`;
   for (const [ts, dir] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"}\n`;
+  if (gaps.length) {
+    t += `\n計測が止まっていた時間,長さ(秒)\n`;
+    for (const [ts, sec] of gaps) t += `${new Date(ts).toLocaleString("ja-JP")},${sec}\n`;
+  }
   return t;
 }
 $("btnCsv").onclick = async () => {
@@ -338,11 +389,20 @@ $("btnSend").onclick = () => { if (!cfg.url) { alert("詳細設定でGASのURL�
 
 // ---------------------------------------------------------------- モード切替
 async function keepAwake() { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {} }
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { keepAwake(); if (video.paused) video.play().catch(() => {}); } });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
+  keepAwake(); if (video.paused) video.play().catch(() => {});
+  if (hiddenAt) {
+    const sec = Math.round((Date.now() - hiddenAt) / 1000);
+    // 15秒を超える中断は「計測が止まっていた時間」として記録する（画面オフ・他アプリ切替）
+    if (mode === "run" && sec > 15) { gaps.push([new Date(hiddenAt).toISOString(), sec]); LS.set("vc_gaps", gaps); showGap(); }
+    hiddenAt = 0;
+  }
+});
 function showRun() {
   LS.set("vc_running", true);
   mode = "run"; $("setupBar").style.display = "none"; $("settings").style.display = "none"; $("run").style.display = "block";
-  $("hint").style.display = "none"; renderCounts(); renderStatus(); keepAwake();
+  $("hint").style.display = "none"; renderCounts(); renderStatus(); keepAwake(); showGap(); checkOffline();
   clearInterval(timer); timer = setInterval(tick, 1000 / cfg.fps);
 }
 function showSetup() {
@@ -374,7 +434,7 @@ $("btnSaveSettings").onclick = () => {
   if (camChanged) startCamera().then(() => { drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
   showSetup();
 };
-$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, hourly: {}, events: [] }; LS.set("vc_data", data); renderCounts(); $("logBox").value = csvText(); } };
+$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, hourly: {}, events: [] }; LS.set("vc_data", data); gaps = []; LS.set("vc_gaps", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
 $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
 $("btnDim").onclick = () => { $("dim").style.display = "block"; };
 $("dim").onclick = () => { $("dim").style.display = "none"; };
@@ -386,7 +446,7 @@ $("dim").onclick = () => { $("dim").style.display = "none"; };
     await startCamera();
     drawSetup();
     await loadModel();
-    renderCounts();
+    renderCounts(); showGap(); setTimeout(checkOffline, 2500);
     if (cfg.line) drawSetup();
     // 直前まで計測中だった場合（再読み込み・復帰）は自動で再開
     if (LS.get("vc_running", false) && cfg.line) showRun();
