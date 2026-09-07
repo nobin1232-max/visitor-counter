@@ -92,6 +92,8 @@
     <select id="optFps"><option value="3">3</option><option value="5" selected>5</option><option value="8">8</option></select>
     <label>検出の確信度しきい値<span class="small">　誤検出が多ければ上げる</span></label>
     <select id="optConf"><option value="0.3">0.3</option><option value="0.4" selected>0.4</option><option value="0.5">0.5</option><option value="0.6">0.6</option></select>
+    <label>検出の精度<span class="small">　「精度優先」は重なった人・遠くの人に強いが、1コマの処理が2〜3倍重い。切り替えたら電波のある場所で一度開き直す</span></label>
+    <select id="optModel"><option value="fast" selected>速さ優先（既定）</option><option value="accurate">精度優先</option></select>
     <label>人の位置の基準<span class="small">　真上カメラ=中心、斜めカメラ=足元</span></label>
     <select id="optAnchor"><option value="center" selected>中心</option><option value="bottom">足元</option></select>
     <label>動きが無いときは検出を休む（省電力）</label>
@@ -137,7 +139,7 @@ const LS = {
   get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
-const CFG_DEF = { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true,
+const CFG_DEF = { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true, model: "fast",
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg", {}));
@@ -442,12 +444,26 @@ async function startCamera() {
   vw = video.videoWidth; vh = video.videoHeight;
   overlay.width = vw; overlay.height = vh;
 }
+const MODELS = {
+  fast: { url: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite", name: "速さ優先" },
+  accurate: { url: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite", name: "精度優先" },
+};
+let modelUsed = "";
 async function loadModel() {
   $("hint").textContent = "AIモデルを読み込み中…（初回のみ数十秒）";
   const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm");
-  detector = await ObjectDetector.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite", delegate: "GPU" },
+  const opts = (url) => ({ baseOptions: { modelAssetPath: url, delegate: "GPU" },
     runningMode: "VIDEO", scoreThreshold: 0.3, maxResults: 12, categoryAllowlist: ["person"] });
+  const want = MODELS[cfg.model] ? cfg.model : "fast";
+  try {
+    detector = await ObjectDetector.createFromOptions(vision, opts(MODELS[want].url));
+    modelUsed = MODELS[want].name;
+  } catch (e) {
+    if (want === "fast") throw e;
+    // 精度優先が読めなかったとき（未保存でオフライン等）は、確実に動く方に戻す
+    detector = await ObjectDetector.createFromOptions(vision, opts(MODELS.fast.url));
+    modelUsed = MODELS.fast.name + "（精度優先は読み込めませんでした）";
+  }
 }
 
 // ---------------------------------------------------------------- 設定モード（ライン引き）
@@ -570,8 +586,14 @@ function renderCounts() {
   $("miniCount").textContent = `${data.totalIn} / ${data.totalOut}`;
   if ($("rep")) $("rep").textContent = repText();
 }
+let busy = false;
 async function tick() {
   if (mode !== "run" || paused || !detector || video.readyState < 2) return;
+  if (busy) return;   // 前のコマの処理が終わっていないときは飛ばす（処理の渋滞と発熱を防ぐ）
+  busy = true;
+  try { await tickBody(); } finally { busy = false; }
+}
+async function tickBody() {
   const now = performance.now();
   const motion = cfg.motion ? hasMotion() : true;
   if (motion) lastMotionAt = now;
@@ -599,9 +621,9 @@ async function tick() {
 }
 function renderStatus() {
   const ev = cfg.evidence ? `  証拠 ${evCount}枚` : "";
-  const s = `${vw}×${vh}  推論 ${inferMs.toFixed(0)}ms/コマ  処理 ${processed}  省略 ${skipped}  追跡中 ${tracks.size}` +
+  const s = `${vw}×${vh}  ${modelUsed}  推論 ${inferMs.toFixed(0)}ms/コマ  処理 ${processed}  省略 ${skipped}  追跡中 ${tracks.size}` +
     ev + (cfg.url ? `  送信 ${lastSendAt ? new Date(lastSendAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "未"}` : "  送信なし（端末内保存）");
-  $("status").textContent = s;
+  $("status").textContent = s + (inferMs > 1000 / cfg.fps ? "　⚠ 処理が追いついていません。処理コマ数を下げてください" : "");
 }
 
 // ---------------------------------------------------------------- 送信・CSV
@@ -666,7 +688,7 @@ function showSetup() {
 function showSettings() {
   mode = "settings"; clearInterval(timer); $("run").style.display = "none"; $("setupBar").style.display = "none"; $("stage").style.display = "none";
   $("settings").style.display = "block";
-  $("optFps").value = cfg.fps; $("optConf").value = cfg.conf; $("optAnchor").value = cfg.anchor; $("optMotion").value = cfg.motion ? "1" : "0";
+  $("optFps").value = cfg.fps; $("optConf").value = cfg.conf; $("optModel").value = cfg.model; $("optAnchor").value = cfg.anchor; $("optMotion").value = cfg.motion ? "1" : "0";
   $("optRepWin").value = cfg.repWin; $("optRepTh").value = cfg.repTh;
   $("optEvid").value = cfg.evidence ? "1" : "0"; $("optEvEvery").value = cfg.evEvery; $("optEvMax").value = cfg.evMax;
   $("optUrl").value = cfg.url; $("optToken").value = cfg.token; $("optInterval").value = cfg.interval; $("optName").value = cfg.name;
@@ -682,6 +704,7 @@ $("btnStart").onclick = () => { if (!cfg.line) { alert("先にラインを引い
 $("btnStop").onclick = showSetup;
 $("btnSettings").onclick = showSettings;
 $("btnSaveSettings").onclick = () => {
+  const oldModel = cfg.model; cfg.model = $("optModel").value;
   cfg.fps = +$("optFps").value; cfg.conf = +$("optConf").value; cfg.anchor = $("optAnchor").value; cfg.motion = $("optMotion").value === "1";
   cfg.repWin = +$("optRepWin").value; cfg.repTh = +$("optRepTh").value;
   cfg.evidence = $("optEvid").value === "1"; cfg.evEvery = +$("optEvEvery").value; cfg.evMax = +$("optEvMax").value;
@@ -689,6 +712,11 @@ $("btnSaveSettings").onclick = () => {
   const newCam = $("optCam").value; const camChanged = newCam !== (cfg.camId || ""); cfg.camId = newCam;
   LS.set("vc_cfg", cfg);
   if (camChanged) startCamera().then(() => { drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
+  if (cfg.model !== oldModel) {
+    detector = null;
+    loadModel().then(() => { $("hint").textContent = "準備できました（" + modelUsed + "）。画面を2回タップして赤線を引いてください"; })
+      .catch((e) => alert("モデルを読み込めません: " + e.message + "\n電波のある場所で開き直してください"));
+  }
   showSetup();
 };
 $("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, hourly: {}, events: [] }; recentSigs = []; LS.set("vc_data", data); gaps = []; LS.set("vc_gaps", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
