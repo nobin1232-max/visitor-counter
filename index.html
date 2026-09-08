@@ -416,6 +416,7 @@ function repText() {
 
 let mode = "setup";          // setup | run | settings
 let detector = null, stream = null, timer = null, uiTimer = null, wakeLock = null;
+let lastFullAt = 0;   // 最後に本当の検出をした時刻
 let tracks = new Map(), nextId = 1, lastSendAt = 0, paused = false;
 let vw = 0, vh = 0, lastTs = -1, inferMs = 0, skipped = 0, processed = 0, lastMotionAt = 0;
 let motionPrev = null;
@@ -598,10 +599,14 @@ async function tickBody() {
   const motion = cfg.motion ? hasMotion() : true;
   if (motion) lastMotionAt = now;
   const active = tracks.size > 0;
-  if (!motion && !active && now - lastMotionAt > 1500) { skipped++; ctx.clearRect(0, 0, vw, vh); drawLine(cfg.line, false); return; }
+  // 動きが無い間も、2秒に1回は必ず本当の検出をする（動きの判定が小さな人を取りこぼしても拾えるように）
+  if (!motion && !active && now - lastMotionAt > 1500 && now - lastFullAt < 2000) {
+    skipped++; ctx.clearRect(0, 0, vw, vh); drawLine(cfg.line, false); return;
+  }
   let ts = Math.round(now); if (ts <= lastTs) ts = lastTs + 1; lastTs = ts;
   const t0 = performance.now();
   const res = detector.detectForVideo(video, ts);
+  lastFullAt = now;
   inferMs = inferMs * 0.9 + (performance.now() - t0) * 0.1; processed++;
   const dets = res.detections.filter((d) => d.categories[0].score >= cfg.conf).map((d) => Object.assign(anchorOf(d.boundingBox), { bb: d.boundingBox }));
   const matched = associate(dets, Date.now());
