@@ -109,7 +109,7 @@
     <label>同一人物らしき再通過の照合<span class="small">　この時間内に似た人が再び通ったら印を付ける（数は減らしません）</span></label>
     <select id="optRepWin"><option value="0">照合しない</option><option value="5">5分以内</option><option value="15" selected>15分以内</option><option value="60">1時間以内</option></select>
     <label>同一とみなす似ている度<span class="small">　同じ人を別人と数えるなら「ゆるめ」、別人を同一とするなら「厳しめ」</span></label>
-    <select id="optRepTh"><option value="8">厳しめ（取りこぼしても誤りを避ける）</option><option value="11" selected>標準</option><option value="15">ゆるめ（多めに印を付ける）</option></select>
+    <select id="optRepTh"><option value="8" selected>厳しめ（取りこぼしても誤りを避ける）</option><option value="11">標準</option><option value="15">ゆるめ（多めに印を付ける）</option></select>
     <label>検証用スナップショット<span class="small">　通過の瞬間を小さな写真で保存（1件約10KB）。あとで見返して検証できます</span></label>
     <select id="optEvid"><option value="1" selected>保存する</option><option value="0">保存しない</option></select>
     <label>定点スナップショット<span class="small">　カメラのズレ確認用。この間隔で1枚ずつ保存</span></label>
@@ -140,7 +140,7 @@ const LS = {
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
 const CFG_DEF = { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true, model: "fast",
-  url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
+  url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 8 };
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg", {}));
 if (![8, 11, 15].includes(cfg.repTh)) cfg.repTh = CFG_DEF.repTh;   // 似ている度の目盛りが変わったため
@@ -411,11 +411,11 @@ function repText() {
   const r = (data.repIn || 0) + (data.repOut || 0);
   if (!cfg.repWin) return "";
   if (!r) return "同一人物らしき再通過: 0件";
-  return `同一人物らしき再通過: ${r}件（入場${data.repIn || 0}・退場${data.repOut || 0}）　→ 除いた推定: 入場 ${data.totalIn - (data.repIn || 0)} ／ 退場 ${data.totalOut - (data.repOut || 0)}`;
+  return `同一人物らしき再通過: ${r}件（入場${data.repIn || 0}・退場${data.repOut || 0}）　※あくまで候補。写真で確かめてください`;
 }
 
 let mode = "setup";          // setup | run | settings
-let detector = null, stream = null, timer = null, wakeLock = null;
+let detector = null, stream = null, timer = null, uiTimer = null, wakeLock = null;
 let tracks = new Map(), nextId = 1, lastSendAt = 0, paused = false;
 let vw = 0, vh = 0, lastTs = -1, inferMs = 0, skipped = 0, processed = 0, lastMotionAt = 0;
 let motionPrev = null;
@@ -621,7 +621,9 @@ async function tickBody() {
 }
 function renderStatus() {
   const ev = cfg.evidence ? `  証拠 ${evCount}枚` : "";
-  const s = `${vw}×${vh}  ${modelUsed}  推論 ${inferMs.toFixed(0)}ms/コマ  処理 ${processed}  省略 ${skipped}  追跡中 ${tracks.size}` +
+  const last = data.events.length ? new Date(data.events[data.events.length - 1][0]) : null;
+  const lastTxt = last ? `　最後に数えたのは ${last.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}` : "";
+  const s = `${vw}×${vh}  ${new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}${lastTxt}  ${modelUsed}  推論 ${inferMs.toFixed(0)}ms/コマ  処理 ${processed}  省略 ${skipped}  追跡中 ${tracks.size}` +
     ev + (cfg.url ? `  送信 ${lastSendAt ? new Date(lastSendAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "未"}` : "  送信なし（端末内保存）");
   $("status").textContent = s + (inferMs > 1000 / cfg.fps ? "　⚠ 処理が追いついていません。処理コマ数を下げてください" : "");
 }
@@ -679,14 +681,15 @@ function showRun() {
   mode = "run"; $("setupBar").style.display = "none"; $("settings").style.display = "none"; $("run").style.display = "block";
   $("hint").style.display = "none"; renderCounts(); renderStatus(); keepAwake(); showGap(); checkOffline();
   clearInterval(timer); timer = setInterval(tick, 1000 / cfg.fps);
+  clearInterval(uiTimer); uiTimer = setInterval(renderStatus, 5000);   // 人がいない間も「動いている」ことが分かるように
 }
 function showSetup() {
   LS.set("vc_running", false);
-  mode = "setup"; clearInterval(timer); $("run").style.display = "none"; $("settings").style.display = "none";
+  mode = "setup"; clearInterval(timer); clearInterval(uiTimer); $("run").style.display = "none"; $("settings").style.display = "none";
   $("setupBar").style.display = "flex"; $("hint").style.display = "block"; $("stage").style.display = "block"; tmpPts = []; drawSetup();
 }
 function showSettings() {
-  mode = "settings"; clearInterval(timer); $("run").style.display = "none"; $("setupBar").style.display = "none"; $("stage").style.display = "none";
+  mode = "settings"; clearInterval(timer); clearInterval(uiTimer); $("run").style.display = "none"; $("setupBar").style.display = "none"; $("stage").style.display = "none";
   $("settings").style.display = "block";
   $("optFps").value = cfg.fps; $("optConf").value = cfg.conf; $("optModel").value = cfg.model; $("optAnchor").value = cfg.anchor; $("optMotion").value = cfg.motion ? "1" : "0";
   $("optRepWin").value = cfg.repWin; $("optRepTh").value = cfg.repTh;
