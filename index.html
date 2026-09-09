@@ -106,6 +106,8 @@
     <select id="optInterval"><option value="5" selected>5</option><option value="10">10</option><option value="30">30</option></select>
     <label>使うカメラ<span class="small">　iPhoneは「背面」推奨。Macで試すときは FaceTime HD を選ぶ</span></label>
     <select id="optCam"><option value="">自動（背面カメラ）</option></select>
+    <label>同じ人を続けて数えない時間<span class="small">　ライン際を行き来する人を重複して数えないための待ち時間</span></label>
+    <select id="optCool"><option value="0">なし</option><option value="5">5秒</option><option value="10" selected>10秒</option><option value="30">30秒</option></select>
     <label>同一人物らしき再通過の照合<span class="small">　この時間内に似た人が再び通ったら印を付ける（数は減らしません）</span></label>
     <select id="optRepWin"><option value="0">照合しない</option><option value="5">5分以内</option><option value="15" selected>15分以内</option><option value="60">1時間以内</option></select>
     <label>同一とみなす似ている度<span class="small">　同じ人を別人と数えるなら「ゆるめ」、別人を同一とするなら「厳しめ」</span></label>
@@ -139,7 +141,7 @@ const LS = {
   get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
-const CFG_DEF = { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true, model: "fast",
+const CFG_DEF = { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true, model: "fast", cool: 10,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 8 };
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg", {}));
@@ -563,7 +565,10 @@ function updateTrack(id, pt, now) {
     t.far = Math.max(t.far, Math.abs(t.lastSide));
     if (t.far / L >= Math.max(8, vw * 0.015) && intersects(t.pt, pt, a, b)) {
       dir = s > 0 ? "in" : "out"; if (cfg.flip) dir = dir === "in" ? "out" : "in";
-      if (t.counted.length && t.counted[t.counted.length - 1] === dir) dir = null; else t.counted.push(dir);
+      // 同じ人が数秒で引き返しただけのときは数え直さない（ライン際で行き来する人の重複を防ぐ）
+      if (t.counted.length && t.counted[t.counted.length - 1] === dir) dir = null;
+      else if (t.lastCountAt && cfg.cool && now - t.lastCountAt < cfg.cool * 1000) { dir = null; t.bounced = (t.bounced || 0) + 1; }
+      else { t.counted.push(dir); t.lastCountAt = now; }
     }
     t.far = 0;
   } else t.far = Math.max(t.far, Math.abs(s));
@@ -697,7 +702,7 @@ function showSettings() {
   mode = "settings"; clearInterval(timer); clearInterval(uiTimer); $("run").style.display = "none"; $("setupBar").style.display = "none"; $("stage").style.display = "none";
   $("settings").style.display = "block";
   $("optFps").value = cfg.fps; $("optConf").value = cfg.conf; $("optModel").value = cfg.model; $("optAnchor").value = cfg.anchor; $("optMotion").value = cfg.motion ? "1" : "0";
-  $("optRepWin").value = cfg.repWin; $("optRepTh").value = cfg.repTh;
+  $("optCool").value = cfg.cool; $("optRepWin").value = cfg.repWin; $("optRepTh").value = cfg.repTh;
   $("optEvid").value = cfg.evidence ? "1" : "0"; $("optEvEvery").value = cfg.evEvery; $("optEvMax").value = cfg.evMax;
   $("optUrl").value = cfg.url; $("optToken").value = cfg.token; $("optInterval").value = cfg.interval; $("optName").value = cfg.name;
   $("logBox").value = csvText();
@@ -714,7 +719,7 @@ $("btnSettings").onclick = showSettings;
 $("btnSaveSettings").onclick = () => {
   const oldModel = cfg.model; cfg.model = $("optModel").value;
   cfg.fps = +$("optFps").value; cfg.conf = +$("optConf").value; cfg.anchor = $("optAnchor").value; cfg.motion = $("optMotion").value === "1";
-  cfg.repWin = +$("optRepWin").value; cfg.repTh = +$("optRepTh").value;
+  cfg.cool = +$("optCool").value; cfg.repWin = +$("optRepWin").value; cfg.repTh = +$("optRepTh").value;
   cfg.evidence = $("optEvid").value === "1"; cfg.evEvery = +$("optEvEvery").value; cfg.evMax = +$("optEvMax").value;
   cfg.url = $("optUrl").value.trim(); cfg.token = $("optToken").value.trim(); cfg.interval = +$("optInterval").value; cfg.name = $("optName").value.trim() || "入口1";
   const newCam = $("optCam").value; const camChanged = newCam !== (cfg.camId || ""); cfg.camId = newCam;
