@@ -683,7 +683,8 @@ function associate(dets, now) {
     used.add(c.i); matchedT.add(c.id); result.push({ id: c.id, det: dets[c.i] });
   }
   dets.forEach((d, i) => { if (!used.has(i)) { const id = nextId++; tracks.set(id, { pt: d, lastSide: null, far: 0, seen: now, counted: [], sigs: [] }); result.push({ id, det: d, fresh: true }); } });
-  for (const [id, t] of tracks) if (now - t.seen > 2000) tracks.delete(id);
+  // 2秒以上見えていない追跡は消す（このコマで対応づいたものは残す。消すと処理が止まる不具合があった）
+  for (const [id, t] of tracks) if (now - t.seen > 2000 && !matchedT.has(id)) tracks.delete(id);
   return result;
 }
 function updateTrack(id, pt, now) {

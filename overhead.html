@@ -143,14 +143,25 @@ const LS = {
 };
 const CFG_DEF = { line: null, flip: false, fps: 8, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
+const VER = "頭上版 v2.0（9/27）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
+// v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
+if (!cfg.ohv2) { if (cfg.typical) cfg.typical = Math.round(cfg.typical * 2.25); cfg.ohv2 = true; LS.set("vc_cfg_oh", cfg); }
 if (![8, 11, 15].includes(cfg.repTh)) cfg.repTh = CFG_DEF.repTh;   // 似ている度の目盛りが変わったため
 let data = LS.get("vc_data_oh", { totalIn: 0, totalOut: 0, hourly: {}, events: [] });
 
 // ---------------------------------------------------------------- オフライン対応
-let swReady = false;
+let swReady = false, pendingReload = false;
 if ("serviceWorker" in navigator) {
+  // 新しい版が入ったら読み込み直す（計測中なら「設定に戻る」まで待つ）
+  const hadCtl = !!navigator.serviceWorker.controller;
+  let reloading = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadCtl || reloading) return;
+    if (mode === "run") { pendingReload = true; const el = $("offline"); if (el) el.textContent = "新しい版を受け取りました。「設定に戻る」を押すと切り替わります"; return; }
+    reloading = true; location.reload();
+  });
   navigator.serviceWorker.register("./sw.js").then((reg) => {
     swReady = true;
     navigator.serviceWorker.addEventListener("message", (e) => {
@@ -159,9 +170,9 @@ if ("serviceWorker" in navigator) {
   }).catch(() => {});
 }
 function renderOffline(n) {
-  const el = $("offline"); if (!el) return;
+  const el = $("offline"); if (!el || pendingReload) return;
   el.textContent = n >= 6
-    ? `オフライン準備OK（${n}件を端末内に保存済み。ネットが無くても起動します）`
+    ? `オフライン準備OK（${n}件を端末内に保存済み。ネットが無くても起動します）　${VER}`
     : `オフライン準備中…（Wi-Fiにつないだまま1〜2分お待ちください／保存 ${n || 0}件）`;
 }
 function checkOffline() {
@@ -447,7 +458,7 @@ async function startCamera() {
   overlay.width = vw; overlay.height = vh;
 }
 // ---------------------------------------------------------------- 背景差分による塊検出
-const BW = 160; let BH = 90;
+const BW = 240; let BH = 135;   // 解析の細かさ（v2で160→240。4mの高さからでも頭が小さくなりすぎないように）
 const bcv = document.createElement("canvas"); const bctx = bcv.getContext("2d", { willReadFrequently: true });
 let bg = null, gray = null, fg = null, fg2 = null, lab = null, absorb = null, typicalArea = 0, fgRatio = 0, highFgSince = 0;
 async function loadModel() {
@@ -547,7 +558,7 @@ function drawSetup() {
   if (pts.length === 2) drawLine(pts, true);
   $("hint").textContent = pts.length === 2
     ? "赤線＝検知ライン。緑矢印が「入場」の向き。逆なら「入退場を反転」。よければ「計測開始」"
-    : "頭上カメラ用（通信不要）。来場者が必ず通る場所を横切るように、画面を2回タップしてラインを引いてください";
+    : "頭上カメラ用（通信不要）。真下を向けて固定し、来場者が必ず通る場所を横切るように画面を2回タップしてラインを引いてください。天井が低いときは詳細設定で「背面超広角カメラ」を選ぶと広く写ります";
 }
 function drawLine(pts, arrow) {
   const [a, b] = pts;
@@ -595,9 +606,16 @@ function associate(dets, now) {
   const maxDist = vw * 0.22;
   const used = new Set(), result = [];
   const cand = [];
-  for (const [id, t] of tracks) for (let i = 0; i < dets.length; i++) {
-    const d = Math.hypot(dets[i].x - t.pt.x, dets[i].y - t.pt.y);
-    if (d < maxDist) cand.push({ id, i, d });
+  // 見失った追跡は「進んでいた向きにそのまま進んだはず」の位置で照合し、古いほど不利にする
+  // （見失った人の追跡が残り、後から来た人がそこへ吸い込まれて数えられない取りこぼしを防ぐ）
+  for (const [id, t] of tracks) {
+    const age = Math.max(0, now - t.seen), ag = Math.min(age, 1000);
+    const px = t.pt.x + (t.vx || 0) * ag, py = t.pt.y + (t.vy || 0) * ag;
+    const pen = age > 350 ? maxDist * 0.6 * Math.min(age, 2000) / 1000 : 0;
+    for (let i = 0; i < dets.length; i++) {
+      const d = Math.hypot(dets[i].x - px, dets[i].y - py);
+      if (d < (age > 250 ? maxDist * 0.5 : maxDist)) cand.push({ id, i, d: d + pen });
+    }
   }
   cand.sort((p, q) => p.d - q.d);
   const matchedT = new Set();
@@ -606,25 +624,35 @@ function associate(dets, now) {
     used.add(c.i); matchedT.add(c.id); result.push({ id: c.id, det: dets[c.i] });
   }
   dets.forEach((d, i) => { if (!used.has(i)) { const id = nextId++; tracks.set(id, { pt: d, lastSide: null, far: 0, seen: now, counted: [], sigs: [] }); result.push({ id, det: d, fresh: true }); } });
-  for (const [id, t] of tracks) if (now - t.seen > 2000) tracks.delete(id);
+  // 2秒以上見えていない追跡は消す（このコマで対応づいたものは残す。消すと処理が止まる不具合があった）
+  for (const [id, t] of tracks) if (now - t.seen > 2000 && !matchedT.has(id)) tracks.delete(id);
   return result;
 }
 function updateTrack(id, pt, now) {
   const t = tracks.get(id); const [a, b] = extLine();
   const s = side(pt, a, b);
   const L = Math.hypot(b.x - a.x, b.y - a.y);
+  if (t.lastCountAt && now - t.seen > 500) t.gapped = true;   // 0.5秒以上見失っていた
   let dir = null;
   if (t.lastSide !== null && t.lastSide !== 0 && (s > 0) !== (t.lastSide > 0)) {
     t.far = Math.max(t.far, Math.abs(t.lastSide));
-    if (t.far / L >= Math.max(8, vw * 0.015) && intersects(t.pt, pt, a, b)) {
+    // 途中から追跡が始まった人も拾えるよう、ラインから離れている必要のある距離は小さめ
+    if (t.far / L >= Math.max(5, vw * 0.01) && intersects(t.pt, pt, a, b)) {
       dir = s > 0 ? "in" : "out"; if (cfg.flip) dir = dir === "in" ? "out" : "in";
       // 同じ人が数秒で引き返しただけのときは数え直さない（ライン際で行き来する人の重複を防ぐ）
+      // ただし、見失ったあと（gapped）や、体の半分以上離れてから戻った場合は別の人とみなす（すれ違い対策）
       if (t.counted.length && t.counted[t.counted.length - 1] === dir) dir = null;
-      else if (t.lastCountAt && cfg.cool && now - t.lastCountAt < cfg.cool * 1000) { dir = null; t.bounced = (t.bounced || 0) + 1; }
-      else { t.counted.push(dir); t.lastCountAt = now; }
+      else if (t.lastCountAt && cfg.cool && !t.gapped && (t.exc || 0) < (t.h || 0) * 0.5 && now - t.lastCountAt < cfg.cool * 1000) { dir = null; t.bounced = (t.bounced || 0) + 1; }
+      else { t.counted.push(dir); t.lastCountAt = now; t.gapped = false; t.exc = 0; }
     }
     t.far = 0;
   } else t.far = Math.max(t.far, Math.abs(s));
+  if (t.lastCountAt && !dir) t.exc = Math.max(t.exc || 0, Math.abs(s) / L);
+  const dt = now - t.seen;
+  if (dt > 0 && dt < 1000) {   // 進む速さ（見失ったときの位置の見込みに使う）
+    t.vx = 0.5 * (t.vx || 0) + 0.5 * (pt.x - t.pt.x) / dt;
+    t.vy = 0.5 * (t.vy || 0) + 0.5 * (pt.y - t.pt.y) / dt;
+  }
   t.pt = pt; t.lastSide = s; t.seen = now;
   return dir;
 }
@@ -650,9 +678,10 @@ async function tick() {
   if (mode !== "run" || paused || !detector || video.readyState < 2) return;
   const now = performance.now();
   const t0 = performance.now();
-  const dets = detectBlobs();
+  const dets = window.__vcFake ? window.__vcFake() : detectBlobs();
   inferMs = inferMs * 0.9 + (performance.now() - t0) * 0.1; processed++;
   const matched = associate(dets, Date.now());
+  const matchedIds = new Set(matched.map((m) => m.id));
   ctx.clearRect(0, 0, vw, vh); drawLine(cfg.line, false);
   absorb.fill(0);
   for (const m of matched) {
@@ -674,13 +703,23 @@ async function tick() {
     }
   }
   for (const m of matched) {
-    collectSig(tracks.get(m.id), m.det.bb);
+    collectSig(tracks.get(m.id), m.det.bb); tracks.get(m.id).h = Math.max(m.det.bb.width, m.det.bb.height);
     const dir = updateTrack(m.id, { x: m.det.x, y: m.det.y }, Date.now());
     if (window.__vcDebug) (window.__vcLog = window.__vcLog || []).push([window.__lastFi, m.id, Math.round(m.det.x), Math.round(m.det.y), dir]);
     if (dir) {
       // まとまって通った場合: 塊の大きさ ÷ 1人分 で人数を推定（1〜4人）
       let k = 1;
       if (cfg.split && typicalArea > 0 && m.det.area) k = Math.max(1, Math.min(4, Math.round(m.det.area / typicalArea)));
+      if (k > 1) {
+        // 同じ塊に含まれていた他の人の追跡は「数え済み」にする（あとで分かれたときの二重カウント防止）
+        const [la, lb] = extLine(); const sNow = side({ x: m.det.x, y: m.det.y }, la, lb); const bb = m.det.bb;
+        const cx = bb.originX + bb.width / 2, cy = bb.originY + bb.height / 2;
+        [...tracks].filter(([id2, t2]) => id2 !== m.id && !matchedIds.has(id2)
+            && Math.abs(t2.pt.x - cx) <= bb.width * 0.7 && Math.abs(t2.pt.y - cy) <= bb.height * 0.7
+            && (side(t2.pt, la, lb) > 0) !== (sNow > 0) && t2.counted[t2.counted.length - 1] !== dir)
+          .sort((p, q) => Math.hypot(p[1].pt.x - cx, p[1].pt.y - cy) - Math.hypot(q[1].pt.x - cx, q[1].pt.y - cy))
+          .slice(0, k - 1).forEach(([, t2]) => { t2.counted.push(dir); t2.lastCountAt = Date.now(); t2.gapped = false; });
+      }
       const rep = checkRepeat(tracks.get(m.id).sigs, dir, Date.now());
       record(dir, k, rep); evSaveEvent(dir, k, m.det.bb, rep); $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600);
       if (k > 1) { ctx.fillStyle = "#fff"; ctx.font = "bold 28px sans-serif"; ctx.fillText(`${k}人`, m.det.x + 10, m.det.y); }
@@ -695,7 +734,7 @@ async function tick() {
 }
 function renderStatus() {
   const ev = cfg.evidence ? `  証拠 ${evCount}枚` : "";
-  const s = `${vw}×${vh}  処理 ${inferMs.toFixed(1)}ms/コマ  コマ ${processed}  前景 ${(fgRatio * 100).toFixed(0)}%  1人分 ${typicalArea ? (typicalArea / (BW * BH) * 100).toFixed(1) + "%" : "未学習"}  追跡中 ${tracks.size}` +
+  const s = `${VER}  ${vw}×${vh}  処理 ${inferMs.toFixed(1)}ms/コマ  コマ ${processed}  前景 ${(fgRatio * 100).toFixed(0)}%  1人分 ${typicalArea ? (typicalArea / (BW * BH) * 100).toFixed(1) + "%" : "未学習"}  追跡中 ${tracks.size}` +
     ev + (cfg.url ? `  送信 ${lastSendAt ? new Date(lastSendAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "未"}` : "  送信なし（端末内保存）");
   $("status").textContent = s;
 }
@@ -756,6 +795,7 @@ function showRun() {
 }
 function showSetup() {
   LS.set("vc_running_oh", false);
+  if (pendingReload) { location.reload(); return; }
   mode = "setup"; clearInterval(timer); $("run").style.display = "none"; $("settings").style.display = "none";
   $("setupBar").style.display = "flex"; $("hint").style.display = "block"; $("stage").style.display = "block"; tmpPts = []; drawSetup();
 }
@@ -818,7 +858,7 @@ $("dim").onclick = () => { $("dim").style.display = "none"; };
     console.error(e);
   }
 })();
-window.__vc = { get data() { return data; }, get cfg() { return cfg; }, get tracks() { return tracks; }, showRun: () => showRun(), setLine: (l, flip) => { cfg.line = l; cfg.flip = !!flip; LS.set("vc_cfg_oh", cfg); } };
+window.__vc = { get typical() { return typicalArea; }, set typical(v) { typicalArea = v; }, get data() { return data; }, get cfg() { return cfg; }, get tracks() { return tracks; }, showRun: () => showRun(), setLine: (l, flip) => { cfg.line = l; cfg.flip = !!flip; LS.set("vc_cfg_oh", cfg); } };
 </script>
 </body>
 </html>
