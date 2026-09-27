@@ -91,9 +91,15 @@
     <label>処理コマ数（毎秒）<span class="small">　少ないほど発熱が小さい。3〜5推奨</span></label>
     <select id="optFps"><option value="3">3</option><option value="5" selected>5</option><option value="8">8</option></select>
     <label>検出の確信度しきい値<span class="small">　誤検出が多ければ上げる</span></label>
-    <select id="optConf"><option value="0.3">0.3</option><option value="0.4" selected>0.4</option><option value="0.5">0.5</option><option value="0.6">0.6</option></select>
+    <select id="optConf"><option value="0.25">0.25</option><option value="0.3">0.3</option><option value="0.4" selected>0.4</option><option value="0.5">0.5</option><option value="0.6">0.6</option></select>
     <label>検出の精度<span class="small">　「精度優先」は重なった人・遠くの人に強いが、1コマの処理が2〜3倍重い。切り替えたら電波のある場所で一度開き直す</span></label>
     <select id="optModel"><option value="fast" selected>速さ優先（既定）</option><option value="accurate">精度優先</option></select>
+    <label>入口まわりを拡大して検出<span class="small">　ラインの周りだけを切り出して大きくしてAIに渡す。高い所からで人が小さく写るときに効く。点線の枠が検出する範囲</span></label>
+    <select id="optRoi"><option value="1" selected>する（推奨）</option><option value="0">しない（画面全体）</option></select>
+    <label>連れ・並び歩きの補正（幅）<span class="small">　1人分より明らかに幅の広い枠がラインを越えたら2〜3人と数える。1人の幅は通った人から自動で覚える</span></label>
+    <select id="optWidth"><option value="1" selected>する（推奨）</option><option value="0">しない</option></select>
+    <label>頭の数で補正（試験中）<span class="small">　ラインを越えた枠の中の人数を骨格AIで数え直す（抱っこの子・重なった人向け）。少し重くなる。初めて使う前に電波のある所で一度開く</span></label>
+    <select id="optPose"><option value="0" selected>しない</option><option value="1">する</option></select>
     <label>人の位置の基準<span class="small">　真上カメラ=中心、斜めカメラ=足元</span></label>
     <select id="optAnchor"><option value="center" selected>中心</option><option value="bottom">足元</option></select>
     <label>動きが無いときは検出を休む（省電力）</label>
@@ -132,7 +138,7 @@
 <div id="dim"><div class="mini" id="miniCount">0 / 0</div></div>
 
 <script type="module">
-import { ObjectDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21";
+import { ObjectDetector, PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21";
 
 // ---------------------------------------------------------------- 状態
 const $ = (id) => document.getElementById(id);
@@ -142,26 +148,39 @@ const LS = {
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
 const CFG_DEF = { line: null, flip: false, fps: 5, conf: 0.4, anchor: "center", motion: true, model: "fast", cool: 10,
-  url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 8 };
+  url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 8,
+  roi: true, widthFix: true, pose: false };
+const VER = "v2.0（9/27 連れ・抱っこ対策）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg", {}));
 if (![8, 11, 15].includes(cfg.repTh)) cfg.repTh = CFG_DEF.repTh;   // 似ている度の目盛りが変わったため
+// v2: 取りこぼし対策として確信度のしきい値を一度だけ 0.3 に下げる（あとで詳細設定から戻せる）
+if (!cfg.v2) { if (cfg.conf > 0.3) cfg.conf = 0.3; cfg.v2 = true; LS.set("vc_cfg", cfg); }
 let data = LS.get("vc_data", { totalIn: 0, totalOut: 0, hourly: {}, events: [] });
 
 // ---------------------------------------------------------------- オフライン対応
-let swReady = false;
+let swReady = false, pendingReload = false;
 if ("serviceWorker" in navigator) {
+  // 新しい版が入ったら読み込み直す（計測中なら「設定に戻る」まで待つ）
+  const hadCtl = !!navigator.serviceWorker.controller;
+  let reloading = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadCtl || reloading) return;
+    if (mode === "run") { pendingReload = true; const el = $("offline"); if (el) el.textContent = "新しい版を受け取りました。「設定に戻る」を押すと切り替わります"; return; }
+    reloading = true; location.reload();
+  });
   navigator.serviceWorker.register("./sw.js").then((reg) => {
     swReady = true;
     navigator.serviceWorker.addEventListener("message", (e) => {
-      if (e.data && e.data.type === "vc-cache-status") renderOffline(e.data.count);
+      if (e.data && e.data.type === "vc-cache-status") renderOffline(e.data.count, e.data.pose);
     });
   }).catch(() => {});
 }
-function renderOffline(n) {
+function renderOffline(n, pose) {
   const el = $("offline"); if (!el) return;
+  if (pendingReload) return;
   el.textContent = n >= 6
-    ? `オフライン準備OK（${n}件を端末内に保存済み。ネットが無くても起動します）`
+    ? `オフライン準備OK（${n}件を端末内に保存済み。ネットが無くても起動します${pose ? "／頭数補正も可" : ""}）　${VER}`
     : `オフライン準備中…（Wi-Fiにつないだまま1〜2分お待ちください／保存 ${n || 0}件）`;
 }
 function checkOffline() {
@@ -451,12 +470,13 @@ const MODELS = {
   fast: { url: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite", name: "速さ優先" },
   accurate: { url: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite", name: "精度優先" },
 };
-let modelUsed = "";
+let modelUsed = "", vision = null;
 async function loadModel() {
   $("hint").textContent = "AIモデルを読み込み中…（初回のみ数十秒）";
-  const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm");
+  vision = vision || await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm");
+  // 重なった人を拾えるよう、AI側の足切りは低めにしておき、画面の設定（cfg.conf）で絞る
   const opts = (url) => ({ baseOptions: { modelAssetPath: url, delegate: "GPU" },
-    runningMode: "VIDEO", scoreThreshold: 0.3, maxResults: 12, categoryAllowlist: ["person"] });
+    runningMode: "VIDEO", scoreThreshold: 0.2, maxResults: 20, categoryAllowlist: ["person"] });
   const want = MODELS[cfg.model] ? cfg.model : "fast";
   try {
     detector = await ObjectDetector.createFromOptions(vision, opts(MODELS[want].url));
@@ -467,6 +487,104 @@ async function loadModel() {
     detector = await ObjectDetector.createFromOptions(vision, opts(MODELS.fast.url));
     modelUsed = MODELS.fast.name + "（精度優先は読み込めませんでした）";
   }
+  await loadPose();
+}
+
+// ---------------------------------------------------------------- 頭の数（骨格AI）での補正　※試験中
+// ラインを越えた枠の中を切り出し、骨格AIで何人いるかを数える。抱っこの子・重なって1つの枠になった人向け。
+const POSE_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+let poseLm = null, poseState = "";
+async function loadPose() {
+  if (!cfg.pose) { poseLm = null; poseState = ""; return; }
+  if (poseLm) return;
+  try {
+    vision = vision || await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm");
+    poseLm = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: POSE_URL, delegate: "GPU" }, runningMode: "IMAGE", numPoses: 5,
+      minPoseDetectionConfidence: 0.3, minPosePresenceConfidence: 0.3, minTrackingConfidence: 0.3 });
+    poseState = "頭数補正ON";
+  } catch (e) {
+    poseLm = null; poseState = "頭数補正: 読み込めません（電波のある所で開き直してください）";
+  }
+}
+const poseCv = document.createElement("canvas"); const poseCx = poseCv.getContext("2d");
+function poseCount(bb) {
+  if (!poseLm || !bb) return 0;
+  const mx = bb.width * 0.15, my = bb.height * 0.1;
+  const x = Math.max(0, bb.originX - mx), y = Math.max(0, bb.originY - my);
+  const w = Math.min(vw - x, bb.width + mx * 2), h = Math.min(vh - y, bb.height + my * 2);
+  if (w < 8 || h < 8) return 0;
+  const s = Math.min(3, 320 / Math.max(w, h));
+  poseCv.width = Math.round(w * s); poseCv.height = Math.round(h * s);
+  try {
+    poseCx.drawImage(video, x, y, w, h, 0, 0, poseCv.width, poseCv.height);
+    const r = poseLm.detect(poseCv);
+    return (r && r.landmarks) ? r.landmarks.length : 0;
+  } catch { return 0; }
+}
+
+// ---------------------------------------------------------------- 入口まわりの切り出し（拡大して検出）
+const roiCv = document.createElement("canvas"); const roiCx = roiCv.getContext("2d");
+// 人の大きさ（ラインを越えたときの枠の高さ）を覚える。8人分たまるまでは画面全体で検出する
+let href = LS.get("vc_href", []);
+function learnHeight(h) { href.push(h); if (href.length > 40) href.shift(); LS.set("vc_href", href); }
+function roiRect() {
+  if (!cfg.roi || !cfg.line || !vw || href.length < 8) return null;
+  const [a, b] = cfg.line;
+  const L = Math.hypot(b.x - a.x, b.y - a.y);
+  const m = Math.max(L * 0.3, median(href) * 1.3);   // ラインの前後にとる余白（人の背丈の1.3倍以上）
+  const x0 = Math.max(0, Math.min(a.x, b.x) - m), y0 = Math.max(0, Math.min(a.y, b.y) - m);
+  const x1 = Math.min(vw, Math.max(a.x, b.x) + m), y1 = Math.min(vh, Math.max(a.y, b.y) + m);
+  const w = x1 - x0, h = y1 - y0;
+  if (w * h > vw * vh * 0.8) return null;   // ほぼ全画面なら切り出す意味がない
+  return { x: x0, y: y0, w, h };
+}
+function detectFrame(ts) {
+  const r = roiRect();
+  if (!r) return detector.detectForVideo(video, ts).detections.map((d) => ({ score: d.categories[0].score, bb: d.boundingBox }));
+  const s = Math.max(1, Math.min(3, 480 / Math.max(r.w, r.h)));
+  const cw = Math.round(r.w * s), ch = Math.round(r.h * s);
+  if (roiCv.width !== cw || roiCv.height !== ch) { roiCv.width = cw; roiCv.height = ch; }
+  roiCx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, cw, ch);
+  return detector.detectForVideo(roiCv, ts).detections.map((d) => {
+    const b = d.boundingBox;
+    return { score: d.categories[0].score,
+      bb: { originX: r.x + b.originX / s, originY: r.y + b.originY / s, width: b.width / s, height: b.height / s } };
+  });
+}
+function drawRoi() {
+  const r = roiRect(); if (!r) return;
+  ctx.save(); ctx.setLineDash([8, 6]); ctx.strokeStyle = "rgba(10,132,255,.8)"; ctx.lineWidth = 2;
+  ctx.strokeRect(r.x, r.y, r.w, r.h); ctx.restore();
+}
+
+// ---------------------------------------------------------------- 連れ・並び歩きの補正（幅）
+// ラインに沿った向きの枠の幅を、1人分の幅（最近通った人の中央値）と比べる。
+let wref = LS.get("vc_wref", []);
+function alongExt(bb) {
+  const [a, b] = cfg.line; const L = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  return bb.width * Math.abs(b.x - a.x) / L + bb.height * Math.abs(b.y - a.y) / L;
+}
+function median(arr) { const v = arr.slice().sort((p, q) => p - q); return v.length ? v[v.length >> 1] : 0; }
+function widthK(bb) {
+  const ext = alongExt(bb);
+  const med = wref.length >= 8 ? median(wref) : 0;
+  const ratio = med ? ext / med : 1;
+  const k = ratio >= 3.4 ? 4 : ratio >= 2.6 ? 3 : ratio >= 1.75 ? 2 : 1;
+  // 1人分の幅を覚える（明らかに広いものは入れない）
+  if (!med || ratio < 1.4) { wref.push(ext); if (wref.length > 40) wref.shift(); LS.set("vc_wref", wref); }
+  return cfg.widthFix && med ? k : 1;
+}
+const inBox = (p, bb, f = 1) => {
+  const cx = bb.originX + bb.width / 2, cy = bb.originY + bb.height / 2;
+  return Math.abs(p.x - cx) <= bb.width * f / 2 && Math.abs(p.y - cy) <= bb.height * f / 2;
+};
+// 1つの枠が何人ぶんか（幅と頭の数の大きい方。枠の中で別に検出されている人は差し引く）
+function groupK(det, dets) {
+  const others = dets.filter((d) => d !== det && inBox(d, det.bb)).length;
+  const kw = widthK(det.bb);
+  const kp = cfg.pose ? poseCount(det.bb) : 0;
+  return Math.max(1, Math.min(4, Math.max(kw, kp) - others));
 }
 
 // ---------------------------------------------------------------- 設定モード（ライン引き）
@@ -483,7 +601,11 @@ overlay.addEventListener("pointerdown", (ev) => {
   if (mode !== "setup") return;
   if (tmpPts.length >= 2) tmpPts = [];
   tmpPts.push(overlayPoint(ev));
-  if (tmpPts.length === 2) { cfg.line = tmpPts.slice(); LS.set("vc_cfg", cfg); }
+  if (tmpPts.length === 2) {
+    cfg.line = tmpPts.slice(); LS.set("vc_cfg", cfg);
+    // ラインを引き直したら（カメラを動かした可能性があるので）人の大きさは覚え直す
+    href = []; wref = []; LS.set("vc_href", href); LS.set("vc_wref", wref);
+  }
   drawSetup();
 });
 function drawSetup() {
@@ -491,9 +613,9 @@ function drawSetup() {
   const pts = tmpPts.length ? tmpPts : (cfg.line || []);
   ctx.fillStyle = "#ff3b30";
   pts.forEach((p) => { ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill(); });
-  if (pts.length === 2) drawLine(pts, true);
+  if (pts.length === 2) { drawLine(pts, true); drawRoi(); }
   $("hint").textContent = pts.length === 2
-    ? "赤線＝検知ライン。緑矢印が「入場」の向き。逆なら「入退場を反転」。よければ「計測開始」"
+    ? "赤線＝検知ライン。緑矢印が「入場」の向き。逆なら「入退場を反転」。よければ「計測開始」" + (roiRect() ? "　青い点線＝拡大して検出する範囲" : "")
     : "来場者が必ず通る場所を横切るように、画面を2回タップしてラインを引いてください";
 }
 function drawLine(pts, arrow) {
@@ -521,7 +643,7 @@ function drawLine(pts, arrow) {
   ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
 }
 $("btnFlip").onclick = () => { cfg.flip = !cfg.flip; LS.set("vc_cfg", cfg); drawSetup(); };
-$("btnClear").onclick = () => { tmpPts = []; cfg.line = null; LS.set("vc_cfg", cfg); drawSetup(); };
+$("btnClear").onclick = () => { tmpPts = []; cfg.line = null; LS.set("vc_cfg", cfg); href = []; wref = []; LS.set("vc_href", href); LS.set("vc_wref", wref); drawSetup(); };
 
 // ---------------------------------------------------------------- 計測ループ
 function anchorOf(bb) {
@@ -542,9 +664,17 @@ function associate(dets, now) {
   const maxDist = vw * 0.22;
   const used = new Set(), result = [];
   const cand = [];
-  for (const [id, t] of tracks) for (let i = 0; i < dets.length; i++) {
-    const d = Math.hypot(dets[i].x - t.pt.x, dets[i].y - t.pt.y);
-    if (d < maxDist) cand.push({ id, i, d });
+  // 見失った追跡は「進んでいた向きにそのまま進んだはず」の位置で照合し、古いほど不利にする。
+  // （以前は見失った人の最後の位置に追跡が残り、後から来た人がそこを通ると「数え済み」の追跡に
+  //   吸い込まれて数えられないことがあった＝混雑時・人が続くときの取りこぼしの原因）
+  for (const [id, t] of tracks) {
+    const age = Math.max(0, now - t.seen), ag = Math.min(age, 1000);
+    const px = t.pt.x + (t.vx || 0) * ag, py = t.pt.y + (t.vy || 0) * ag;
+    const pen = age > 350 ? maxDist * 0.6 * Math.min(age, 2000) / 1000 : 0;
+    for (let i = 0; i < dets.length; i++) {
+      const d = Math.hypot(dets[i].x - px, dets[i].y - py);
+      if (d < (age > 250 ? maxDist * 0.5 : maxDist)) cand.push({ id, i, d: d + pen });
+    }
   }
   cand.sort((p, q) => p.d - q.d);
   const matchedT = new Set();
@@ -559,30 +689,41 @@ function associate(dets, now) {
 function updateTrack(id, pt, now) {
   const t = tracks.get(id); const [a, b] = extLine();
   const s = side(pt, a, b);
+  if (t.lastCountAt && now - t.seen > 500) t.gapped = true;   // 0.5秒以上見失っていた
   const L = Math.hypot(b.x - a.x, b.y - a.y);
   let dir = null;
   if (t.lastSide !== null && t.lastSide !== 0 && (s > 0) !== (t.lastSide > 0)) {
     t.far = Math.max(t.far, Math.abs(t.lastSide));
-    if (t.far / L >= Math.max(8, vw * 0.015) && intersects(t.pt, pt, a, b)) {
+    // 重なりが解けて途中から追跡が始まった人も拾えるよう、ラインから離れている必要のある距離は小さめ
+    if (t.far / L >= Math.max(5, vw * 0.01) && intersects(t.pt, pt, a, b)) {
       dir = s > 0 ? "in" : "out"; if (cfg.flip) dir = dir === "in" ? "out" : "in";
       // 同じ人が数秒で引き返しただけのときは数え直さない（ライン際で行き来する人の重複を防ぐ）
       if (t.counted.length && t.counted[t.counted.length - 1] === dir) dir = null;
-      else if (t.lastCountAt && cfg.cool && now - t.lastCountAt < cfg.cool * 1000) { dir = null; t.bounced = (t.bounced || 0) + 1; }
-      else { t.counted.push(dir); t.lastCountAt = now; }
+      // 見失ってから別の人に引き継がれた追跡（gapped）は、待ち時間で止めない（逆向きに通った別の人を取りこぼさないため）
+      // また、数えたあとラインから体の半分以上離れてから戻ってきた場合も別の人とみなす（入る人と出る人のすれ違い）
+      else if (t.lastCountAt && cfg.cool && !t.gapped && (t.exc || 0) < (t.h || 0) * 0.5 && now - t.lastCountAt < cfg.cool * 1000) { dir = null; t.bounced = (t.bounced || 0) + 1; }
+      else { t.counted.push(dir); t.lastCountAt = now; t.gapped = false; t.exc = 0; }
     }
     t.far = 0;
   } else t.far = Math.max(t.far, Math.abs(s));
+  if (t.lastCountAt && !dir) t.exc = Math.max(t.exc || 0, Math.abs(s) / L);   // 数えたあとラインから離れた距離
+  const dt = now - t.seen;
+  if (dt > 0 && dt < 1000) {   // 進む速さ（見失ったときの位置の見込みに使う）
+    t.vx = 0.5 * (t.vx || 0) + 0.5 * (pt.x - t.pt.x) / dt;
+    t.vy = 0.5 * (t.vy || 0) + 0.5 * (pt.y - t.pt.y) / dt;
+  }
   t.pt = pt; t.lastSide = s; t.seen = now;
   return dir;
 }
-function record(dir, rep) {
+function record(dir, rep, k = 1) {
   const d = new Date();
   if (rep) { if (dir === "in") data.repIn = (data.repIn || 0) + 1; else data.repOut = (data.repOut || 0) + 1; }
+  if (k > 1) { const key = dir === "in" ? "extraIn" : "extraOut"; data[key] = (data[key] || 0) + (k - 1); }
   const hour = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
   data.hourly[hour] = data.hourly[hour] || { in: 0, out: 0 };
-  data.hourly[hour][dir]++;
-  if (dir === "in") data.totalIn++; else data.totalOut++;
-  data.events.push([d.toISOString(), dir, rep ? 1 : 0]);
+  data.hourly[hour][dir] += k;
+  if (dir === "in") data.totalIn += k; else data.totalOut += k;
+  data.events.push([d.toISOString(), dir, rep ? 1 : 0, k]);
   if (data.events.length > 5000) data.events.splice(0, data.events.length - 5000);
   LS.set("vc_data", data);
   renderCounts();
@@ -590,7 +731,12 @@ function record(dir, rep) {
 function renderCounts() {
   $("nIn").textContent = data.totalIn; $("nOut").textContent = data.totalOut;
   $("miniCount").textContent = `${data.totalIn} / ${data.totalOut}`;
-  if ($("rep")) $("rep").textContent = repText();
+  if ($("rep")) $("rep").textContent = [repText(), extraText()].filter(Boolean).join("　");
+}
+function extraText() {
+  const e = (data.extraIn || 0) + (data.extraOut || 0);
+  if (!e) return "";
+  return `うち 連れ・抱っこ補正 +${e}（入場${data.extraIn || 0}・退場${data.extraOut || 0}）`;
 }
 let busy = false;
 async function tick() {
@@ -606,21 +752,36 @@ async function tickBody() {
   const active = tracks.size > 0;
   // 動きが無い間も、2秒に1回は必ず本当の検出をする（動きの判定が小さな人を取りこぼしても拾えるように）
   if (!motion && !active && now - lastMotionAt > 1500 && now - lastFullAt < 2000) {
-    skipped++; ctx.clearRect(0, 0, vw, vh); drawLine(cfg.line, false); return;
+    skipped++; ctx.clearRect(0, 0, vw, vh); drawRoi(); drawLine(cfg.line, false); return;
   }
   let ts = Math.round(now); if (ts <= lastTs) ts = lastTs + 1; lastTs = ts;
   const t0 = performance.now();
-  const res = detector.detectForVideo(video, ts);
+  const raw = window.__vcFake ? window.__vcFake(ts) : detectFrame(ts);
   lastFullAt = now;
   inferMs = inferMs * 0.9 + (performance.now() - t0) * 0.1; processed++;
-  const dets = res.detections.filter((d) => d.categories[0].score >= cfg.conf).map((d) => Object.assign(anchorOf(d.boundingBox), { bb: d.boundingBox }));
+  const dets = raw.filter((d) => d.score >= cfg.conf).map((d) => Object.assign(anchorOf(d.bb), { bb: d.bb }));
   const matched = associate(dets, Date.now());
-  ctx.clearRect(0, 0, vw, vh); drawLine(cfg.line, false);
+  const matchedIds = new Set(matched.map((m) => m.id));
+  ctx.clearRect(0, 0, vw, vh); drawRoi(); drawLine(cfg.line, false);
   for (const m of matched) {
-    collectSig(tracks.get(m.id), m.det.bb);
+    collectSig(tracks.get(m.id), m.det.bb); tracks.get(m.id).h = m.det.bb.height;
     const dir = updateTrack(m.id, { x: m.det.x, y: m.det.y }, Date.now());
     if (window.__vcDebug) (window.__vcLog = window.__vcLog || []).push([window.__lastFi, m.id, Math.round(m.det.x), Math.round(m.det.y), dir]);
-    if (dir) { const rep = checkRepeat(tracks.get(m.id).sigs, dir, Date.now()); record(dir, rep); evSaveEvent(dir, 1, m.det.bb, rep); $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600); }
+    if (dir) {
+      const k = groupK(m.det, dets); learnHeight(m.det.bb.height);
+      if (k > 1) {
+        // 同じ枠に含まれていた他の人の追跡は「数え済み」にする（あとで分かれたときの二重カウント防止）
+        // 対象は「まだラインの手前にいて、この向きに数えていない」追跡だけ（近い順）
+        const [la, lb] = extLine(); const sNow = side({ x: m.det.x, y: m.det.y }, la, lb);
+        const cx = m.det.bb.originX + m.det.bb.width / 2, cy = m.det.bb.originY + m.det.bb.height / 2;
+        [...tracks].filter(([id2, t2]) => id2 !== m.id && !matchedIds.has(id2) && inBox(t2.pt, m.det.bb, 1.4)
+            && (side(t2.pt, la, lb) > 0) !== (sNow > 0) && t2.counted[t2.counted.length - 1] !== dir)
+          .sort((p, q) => Math.hypot(p[1].pt.x - cx, p[1].pt.y - cy) - Math.hypot(q[1].pt.x - cx, q[1].pt.y - cy))
+          .slice(0, k - 1).forEach(([, t2]) => { t2.counted.push(dir); t2.lastCountAt = Date.now(); t2.gapped = false; });
+      }
+      const rep = checkRepeat(tracks.get(m.id).sigs, dir, Date.now()); record(dir, rep, k); evSaveEvent(dir, k, m.det.bb, rep);
+      $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600);
+    }
     const t = tracks.get(m.id); const col = t.counted.length ? "#ff9f0a" : "#4cd964";
     ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.strokeRect(m.det.bb.originX, m.det.bb.originY, m.det.bb.width, m.det.bb.height);
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(m.det.x, m.det.y, 5, 0, Math.PI * 2); ctx.fill();
@@ -633,7 +794,7 @@ function renderStatus() {
   const ev = cfg.evidence ? `  証拠 ${evCount}枚` : "";
   const last = data.events.length ? new Date(data.events[data.events.length - 1][0]) : null;
   const lastTxt = last ? `　最後に数えたのは ${last.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}` : "";
-  const s = `${vw}×${vh}  ${new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}${lastTxt}  ${modelUsed}  推論 ${inferMs.toFixed(0)}ms/コマ  処理 ${processed}  省略 ${skipped}  追跡中 ${tracks.size}` +
+  const s = `${VER}  ${roiRect() ? "拡大検出" : "全体検出"}${poseState ? "  " + poseState : ""}  ${vw}×${vh}  ${new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}${lastTxt}  ${modelUsed}  推論 ${inferMs.toFixed(0)}ms/コマ  処理 ${processed}  省略 ${skipped}  追跡中 ${tracks.size}` +
     ev + (cfg.url ? `  送信 ${lastSendAt ? new Date(lastSendAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "未"}` : "  送信なし（端末内保存）");
   $("status").textContent = s + (inferMs > 1000 / cfg.fps ? "　⚠ 処理が追いついていません。処理コマ数を下げてください" : "");
 }
@@ -657,8 +818,9 @@ function csvText() {
   for (const h of Object.keys(data.hourly).sort()) t += `${h},${data.hourly[h].in},${data.hourly[h].out}\n`;
   t += `合計,${data.totalIn},${data.totalOut}\n`;
   t += `同一人物らしき再通過,${data.repIn || 0},${data.repOut || 0}\n`;
-  t += `再通過を除いた推定,${data.totalIn - (data.repIn || 0)},${data.totalOut - (data.repOut || 0)}\n\n時刻,向き,同一人物らしき\n`;
-  for (const [ts, dir, rep] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"},${rep ? "○" : ""}\n`;
+  t += `うち 連れ・抱っこ補正で加えた人数,${data.extraIn || 0},${data.extraOut || 0}\n`;
+  t += `再通過を除いた推定,${data.totalIn - (data.repIn || 0)},${data.totalOut - (data.repOut || 0)}\n\n時刻,向き,同一人物らしき,人数\n`;
+  for (const [ts, dir, rep, k] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"},${rep ? "○" : ""},${k === undefined ? 1 : k}\n`;
   if (gaps.length) {
     t += `\n計測が止まっていた時間,長さ(秒)\n`;
     for (const [ts, sec] of gaps) t += `${new Date(ts).toLocaleString("ja-JP")},${sec}\n`;
@@ -695,6 +857,7 @@ function showRun() {
 }
 function showSetup() {
   LS.set("vc_running", false);
+  if (pendingReload) { location.reload(); return; }
   mode = "setup"; clearInterval(timer); clearInterval(uiTimer); $("run").style.display = "none"; $("settings").style.display = "none";
   $("setupBar").style.display = "flex"; $("hint").style.display = "block"; $("stage").style.display = "block"; tmpPts = []; drawSetup();
 }
@@ -703,6 +866,7 @@ function showSettings() {
   $("settings").style.display = "block";
   $("optFps").value = cfg.fps; $("optConf").value = cfg.conf; $("optModel").value = cfg.model; $("optAnchor").value = cfg.anchor; $("optMotion").value = cfg.motion ? "1" : "0";
   $("optCool").value = cfg.cool; $("optRepWin").value = cfg.repWin; $("optRepTh").value = cfg.repTh;
+  $("optRoi").value = cfg.roi ? "1" : "0"; $("optWidth").value = cfg.widthFix ? "1" : "0"; $("optPose").value = cfg.pose ? "1" : "0";
   $("optEvid").value = cfg.evidence ? "1" : "0"; $("optEvEvery").value = cfg.evEvery; $("optEvMax").value = cfg.evMax;
   $("optUrl").value = cfg.url; $("optToken").value = cfg.token; $("optInterval").value = cfg.interval; $("optName").value = cfg.name;
   $("logBox").value = csvText();
@@ -720,11 +884,14 @@ $("btnSaveSettings").onclick = () => {
   const oldModel = cfg.model; cfg.model = $("optModel").value;
   cfg.fps = +$("optFps").value; cfg.conf = +$("optConf").value; cfg.anchor = $("optAnchor").value; cfg.motion = $("optMotion").value === "1";
   cfg.cool = +$("optCool").value; cfg.repWin = +$("optRepWin").value; cfg.repTh = +$("optRepTh").value;
+  const oldPose = cfg.pose;
+  cfg.roi = $("optRoi").value === "1"; cfg.widthFix = $("optWidth").value === "1"; cfg.pose = $("optPose").value === "1";
   cfg.evidence = $("optEvid").value === "1"; cfg.evEvery = +$("optEvEvery").value; cfg.evMax = +$("optEvMax").value;
   cfg.url = $("optUrl").value.trim(); cfg.token = $("optToken").value.trim(); cfg.interval = +$("optInterval").value; cfg.name = $("optName").value.trim() || "入口1";
   const newCam = $("optCam").value; const camChanged = newCam !== (cfg.camId || ""); cfg.camId = newCam;
   LS.set("vc_cfg", cfg);
   if (camChanged) startCamera().then(() => { drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
+  if (cfg.pose !== oldPose && cfg.model === oldModel) loadPose().then(() => { if (cfg.pose && !poseLm) alert(poseState); });
   if (cfg.model !== oldModel) {
     detector = null;
     loadModel().then(() => { $("hint").textContent = "準備できました（" + modelUsed + "）。画面を2回タップして赤線を引いてください"; })
@@ -732,7 +899,7 @@ $("btnSaveSettings").onclick = () => {
   }
   showSetup();
 };
-$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, hourly: {}, events: [] }; recentSigs = []; LS.set("vc_data", data); gaps = []; LS.set("vc_gaps", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
+$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, extraIn: 0, extraOut: 0, hourly: {}, events: [] }; recentSigs = []; LS.set("vc_data", data); gaps = []; LS.set("vc_gaps", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
 $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
 $("btnDim").onclick = () => { $("dim").style.display = "block"; };
 $("dim").onclick = () => { $("dim").style.display = "none"; };
@@ -753,7 +920,7 @@ $("dim").onclick = () => { $("dim").style.display = "none"; };
     console.error(e);
   }
 })();
-window.__vc = { get data() { return data; }, get cfg() { return cfg; }, get tracks() { return tracks; }, showRun: () => showRun(), setLine: (l, flip) => { cfg.line = l; cfg.flip = !!flip; LS.set("vc_cfg", cfg); } };
+window.__vc = { get data() { return data; }, get cfg() { return cfg; }, get tracks() { return tracks; }, roiRect: () => roiRect(), get wref() { return wref; }, get vw() { return vw; }, showRun: () => showRun(), setLine: (l, flip) => { cfg.line = l; cfg.flip = !!flip; LS.set("vc_cfg", cfg); } };
 </script>
 </body>
 </html>

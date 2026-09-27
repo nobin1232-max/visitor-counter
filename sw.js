@@ -1,13 +1,22 @@
 /* 来場者カウンター オフライン用サービスワーカー
    一度オンラインで開くと、ページ・AIモデル・部品をすべて端末内に保存する。
    以後はネットが無くても、再読み込み・再起動しても起動できる。 */
+// v2 (2026-09-27): 連れ・抱っこ対策。AIモデル・部品もインストール時に先に保存する。
+// キャッシュ名は変えない（古い保存分を消さず、上書きで新しくする）
 const CACHE = "vc-cache-v1";
-const PRECACHE = ["./", "./index.html", "./overhead.html", "./manifest.webmanifest", "./icon.png"];
+const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21";
+const PRECACHE = ["./", "./index.html", "./overhead.html", "./manifest.webmanifest", "./icon.png",
+  MP, MP + "/wasm/vision_wasm_internal.js", MP + "/wasm/vision_wasm_internal.wasm",
+  MP + "/wasm/vision_wasm_nosimd_internal.js", MP + "/wasm/vision_wasm_nosimd_internal.wasm",
+  "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
+  "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite",
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(
     caches.open(CACHE)
-      .then((c) => Promise.allSettled(PRECACHE.map((u) => c.add(u))))
+      // 取れなかったもの（オフライン等）は、今ある保存分をそのまま使う
+      .then((c) => Promise.allSettled(PRECACHE.map((u) => fetch(u, { cache: "reload" }).then((r) => { if (r && r.ok) return c.put(u, r); }))))
       .then(() => self.skipWaiting())
   );
 });
@@ -53,7 +62,8 @@ self.addEventListener("fetch", (e) => {
 self.addEventListener("message", (e) => {
   if (e.data === "vc-cache-status") {
     caches.open(CACHE).then((c) => c.keys()).then((ks) => {
-      e.source && e.source.postMessage({ type: "vc-cache-status", count: ks.length });
+      const pose = ks.some((r) => r.url.includes("pose_landmarker"));
+      e.source && e.source.postMessage({ type: "vc-cache-status", count: ks.length, pose });
     });
   }
 });
