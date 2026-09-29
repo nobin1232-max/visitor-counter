@@ -145,7 +145,7 @@ const LS = {
 };
 const CFG_DEF = { line: null, flip: false, fps: 8, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v2.1（9/28 影の除外・団体の分割）";
+const VER = "頭上版 v2.2（9/29 見つかるのが遅れた人も数える）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
@@ -465,6 +465,8 @@ const bcv = document.createElement("canvas"); const bctx = bcv.getContext("2d", 
 let bg = null, gray = null, fg = null, fg2 = null, lab = null, absorb = null, typicalArea = 0, fgRatio = 0, highFgSince = 0;
 let bgR = null, bgG = null, bgB = null;   // 影の見分け用（背景の色）
 let typSamples = [];   // 1人分の大きさの学習サンプル
+let recentCounts = [];   // 直近に数えた位置（同じ人の二重カウント防止）
+let bornHot = [];   // ライン際で追跡が始まった場所の記録（同じ場所で何度も現れる＝人以外の可能性）
 async function loadModel() {
   BH = Math.max(40, Math.round(BW * vh / vw)); bcv.width = BW; bcv.height = BH;
   gray = new Float32Array(BW * BH); fg = new Uint8Array(BW * BH); absorb = new Uint8Array(BW * BH); fg2 = new Uint8Array(BW * BH); lab = new Int32Array(BW * BH);
@@ -749,11 +751,48 @@ async function tick() {
     collectSig(tracks.get(m.id), m.det.bb); tracks.get(m.id).h = Math.max(m.det.bb.width, m.det.bb.height);
     let dir = updateTrack(m.id, { x: m.det.x, y: m.det.y }, Date.now());
     if (window.__vcDebug) (window.__vcLog = window.__vcLog || []).push([window.__lastFi, m.id, Math.round(m.det.x), Math.round(m.det.y), dir]);
-    // （v2.1）ライン際で立ち止まっている人のゆらぎを数えない: 現れた場所から体1つ分以上進んでいる人だけ数える
-    if (dir) {
-      const t0 = tracks.get(m.id);
+    // （v2.2）ライン際のゆらぎ対策と、見つかるのが遅れた人の拾い上げ
+    {
+      const t0 = tracks.get(m.id), nowMs = Date.now();
       const need = Math.max(vw * 0.05, Math.sqrt(Math.max(1, typicalArea)) * (vw / BW) * 1.2);
-      if (Math.hypot(m.det.x - t0.origin.x, m.det.y - t0.origin.y) < need) { t0.counted.pop(); t0.lastCountAt = 0; dir = null; }
+      const [la, lb] = extLine(); const L = Math.hypot(lb.x - la.x, lb.y - la.y) || 1;
+      const sNow = side({ x: m.det.x, y: m.det.y }, la, lb);
+      const dirOf = (sv) => { let d = sv > 0 ? "in" : "out"; if (cfg.flip) d = d === "in" ? "out" : "in"; return d; };
+      const movedO = Math.hypot(m.det.x - t0.origin.x, m.det.y - t0.origin.y);
+      if (t0.bornSide === undefined) {   // 現れた場所がラインのすぐ近くか
+        const s0 = side(t0.origin, la, lb);
+        t0.bornSide = s0 > 0; t0.bornDist = Math.abs(s0) / L;
+        // ライン（引いた線そのもの）の端から端の間で現れたか（線の延長部分や端の近くは除く）
+        const [pa, pb] = cfg.line; const ux = pb.x - pa.x, uy = pb.y - pa.y, uu = ux * ux + uy * uy || 1;
+        t0.bornU = ((t0.origin.x - pa.x) * ux + (t0.origin.y - pa.y) * uy) / uu;
+        // 同じ場所で何度も「現れる」ところ（座っている人・反射など）は拾い上げの対象にしない
+        const cell = Math.round(t0.origin.x / need) + "," + Math.round(t0.origin.y / need);
+        t0.bornCell = cell;
+        if (t0.bornDist < need * 1.5) {
+          bornHot.push({ cell, t: nowMs }); while (bornHot.length && nowMs - bornHot[0].t > 300000) bornHot.shift();
+        }
+      }
+      if (dir && movedO < need) {
+        // ライン越えはしたが、まだ体1つ分も進んでいない → すぐには数えず「保留」にする（立ち止まりのゆらぎ対策）
+        t0.counted.pop(); t0.lastCountAt = 0; t0.pending = { dir, side: sNow > 0 }; dir = null;
+      } else if (!dir && t0.pending) {
+        if ((sNow > 0) !== t0.pending.side) t0.pending = null;   // 引き返した → 取り消し
+        else if (movedO >= need) {   // そのまま進んだ → 数える
+          dir = t0.pending.dir; t0.pending = null;
+          if (t0.counted.length && t0.counted[t0.counted.length - 1] === dir) dir = null; else { t0.counted.push(dir); t0.lastCountAt = nowMs; }
+        }
+      }
+      // ラインのすぐ先で初めて見つかった人（ガラス扉の前などで手前側が映りにくい）:
+      // そこからラインと反対向きに体1つ分以上進んだら、ラインを越えてきた人として数える
+      if (!dir && !t0.counted.length && !t0.pending && !t0.bornDone && t0.bornDist < need * 1.5
+          && t0.bornU > 0.06 && t0.bornU < 0.94 && nowMs - t0.born < 4000
+          && (sNow > 0) === t0.bornSide && Math.abs(sNow) / L >= t0.bornDist + need * 1.3 && movedO >= need * 1.3) {
+        t0.bornDone = true;
+        const near = recentCounts.some((r) => nowMs - r.t < 2000 && Math.hypot(r.x - t0.origin.x, r.y - t0.origin.y) < need * 1.5);
+        const hot = bornHot.filter((h) => h.cell === t0.bornCell).length >= 4;
+        if (!near && !hot) { dir = dirOf(sNow); t0.counted.push(dir); t0.lastCountAt = nowMs; }
+      }
+      if (dir) { recentCounts.push({ x: m.det.x, y: m.det.y, t: nowMs }); if (recentCounts.length > 30) recentCounts.shift(); }
     }
     if (dir) {
       // まとまって通った場合: 塊の大きさ ÷ 1人分 で人数を推定（1〜4人）
