@@ -147,7 +147,7 @@ const LS = {
 };
 const CFG_DEF = { line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.2（9/30 少し多めに数える）";
+const VER = "頭上版 v3.2.1（9/30 1人分の学習を修正）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
@@ -584,7 +584,7 @@ function createFlux(o) {
     W: 240, H: 180, sens: 25, shadow: true,
     R: 26, S: 12, bin: 4, lat: 4, thick: 1, occTh: 0.3, relTh: 0.5,
     gapMs: 450, maxMs: 15000, A1: 780, minFrac: 0.3, roundOff: 0.5,
-    learn: true, histN: 30, minHist: 5, learnQ: 0.35,   // v3.2: 1人分を少し小さめに覚える（少し多めに数える） learnRate: 0.3, A1min: 60, A1max: 20000,
+    learn: true, histN: 30, minHist: 5, learnQ: 0.35, learnRate: 0.3, A1min: 60, A1max: 20000,   // v3.2: 1人分を少し小さめに覚える（少し多めに数える）
     expo: true,
     // v3.1: 同時に通った人を「山の数」で分ける
     lobe: true, lsx: 4, lst: 1.5, babs: 0.45, two: 1.8, ro2: 0.5,
