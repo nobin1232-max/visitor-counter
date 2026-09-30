@@ -107,7 +107,7 @@
     <label>数え方<span class="small">　v3「通過量」は、並んで通る人・斜めに通る人・立ち止まる人に強い方式（9/30の録画で、実際の人数の+0%〜+6%。連れの塊は少し多めに数えます）</span></label>
     <select id="optMethod"><option value="flux" selected>通過量で数える（v3.4・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
     <label>多めに数えるか<span class="small">　通過量（v3）のときだけ。「多め」は連れの塊や暗い服の人を多めに拾う（録画で全体+4%、塊ごとに最大+2人）。「ふつう」は数えすぎを抑える（少なめに出やすい）</span></label>
-    <select id="optLean"><option value="more" selected>多め（おすすめ・v3.3）</option><option value="some">少し多め（v3.2）</option><option value="normal">ふつう（v3.1）</option></select>
+    <select id="optLean"><option value="more" selected>おすすめ（v3.6）</option><option value="some">少し多め（v3.2）</option><option value="normal">ふつう（v3.1）</option></select>
     <label>処理コマ数（毎秒）<span class="small">　v3は12推奨（8だと少し取りこぼしが増えます）</span></label>
     <select id="optFps"><option value="5">5</option><option value="8">8</option><option value="12" selected>12</option></select>
     <label>検出感度<span class="small">　影や照明の揺れを拾うなら「低」、人を見逃すなら「高」</span></label>
@@ -163,9 +163,11 @@ const LS = {
 };
 const CFG_DEF = { lean: "more", line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.5（9/30 要確認の記録）";
+const VER = "頭上版 v3.6（10/1 1人分の覚え方を修正）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
+// v3.6: 1人分の覚え方を変えたので、以前に覚えた値は一度だけ捨てて覚え直す
+if (cfg.a1v !== 36) { cfg.a1 = 0; cfg.a1v = 36; LS.set("vc_cfg_oh", cfg); }
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
 if (!cfg.ohv2) { if (cfg.typical) cfg.typical = Math.round(cfg.typical * 2.25); cfg.ohv2 = true; LS.set("vc_cfg_oh", cfg); }
 if (![8, 11, 15].includes(cfg.repTh)) cfg.repTh = CFG_DEF.repTh;   // 似ている度の目盛りが変わったため
@@ -613,6 +615,8 @@ function createFlux(o) {
     staticMs: 6000,
     // v3.3: 塊（連れ）は少し多めに。2秒以上かけて通り、1.3人分以上ある通過は最低2人と数える
     clumpMs: 2000, clumpM: 1.3,
+    // v3.6: 線の上で行き来しただけ（揺れ・引き返し）の通過は、多くても1人と数える
+    backMax: 4,
   }, o);
   const { W, H } = P, N = W * H;
   let bg = null, bgR, bgG, bgB;
@@ -756,12 +760,14 @@ function createFlux(o) {
     }
     if (m < P.minFrac) { stats.zero++; return; }
     let n, lobes = 1;
-    const L = P.lobe ? lobeMasses(e, sgn) : null;
+    const wob = P.backMax && mass > 0 && e.gross / mass > P.backMax;   // v3.6
+    const L = (P.lobe && !wob) ? lobeMasses(e, sgn) : null;
     if (L && L.masses.length > 1) {
       lobes = L.masses.length; const sc = mass / L.fpos; n = 0;
       for (const x of L.masses) { const xm = x * sc / a1; n += xm < P.two ? 1 : Math.floor(xm + 1 - P.ro2); }
     } else n = m < P.two ? 1 : Math.floor(m + 1 - P.ro2);
-    if (e.tEnd - e.tStart >= P.clumpMs && m >= P.clumpM) n = Math.max(n, 2);   // v3.3: 塊は少し多めに
+    if (e.tEnd - e.tStart >= P.clumpMs && m >= P.clumpM && !wob) n = Math.max(n, 2);   // v3.3: 塊は少し多めに
+    if (wob) n = Math.min(n, Math.max(1, Math.round(m)));   // v3.6: 行き来だけの通過は多くても1人程度
     found.push({ dir, k: n, x0: e.x0, x1: e.x1, m, lobes, dur: e.tEnd - e.tStart, back: mass > 0 ? e.gross / mass : 1 });   // v3.5: 要確認の判定用に、通過にかかった時間と行き来の多さも渡す
     // 1人分の学習: 山が1つで、ふつうの大きさ（0.4〜1.6人分）で、行き来の少ない通過だけ使う
     if (P.learn && lobes === 1 && m > 0.4 && m < 1.6 && e.gross < mass * 1.6) {
@@ -886,7 +892,9 @@ function markChk(p, why) {
 }
 // v3.4: 「多めに数えるか」の設定ごとの中身
 const LEAN = {
-  more:   { learnQ: 0.35, minFrac: 0.2, clumpMs: 2000 },   // 多め（v3.3）
+  // v3.6: 1人分は「真ん中の値」で覚える（小さめに覚えると1人を2人と数えやすい）。2人と判定するのは1人分の2.2倍から。
+  //       「ゆっくり通った塊は最低2人」はやめる（線上で立ち止まった1人を2人と数えていた）
+  more:   { learnQ: 0.5, minFrac: 0.2, clumpMs: 1e12, two: 2.2 },
   some:   { learnQ: 0.35, minFrac: 0.3, clumpMs: 1e12 },   // 少し多め（v3.2）
   normal: { learnQ: 0.5,  minFrac: 0.3, clumpMs: 1e12 },   // ふつう（v3.1）
 };
@@ -951,7 +959,7 @@ overlay.addEventListener("pointerdown", (ev) => {
   if (mode !== "setup") return;
   if (tmpPts.length >= 2) tmpPts = [];
   tmpPts.push(overlayPoint(ev));
-  if (tmpPts.length === 2) { cfg.line = tmpPts.slice(); LS.set("vc_cfg_oh", cfg); }
+  if (tmpPts.length === 2) { cfg.line = tmpPts.slice(); cfg.a1 = 0; LS.set("vc_cfg_oh", cfg); }   // v3.6: 線を引き直したら1人分も覚え直す（場所・画角が変わるため）
   drawSetup();
 });
 function drawSetup() {
