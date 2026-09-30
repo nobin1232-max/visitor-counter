@@ -90,8 +90,8 @@
   <!-- 詳細設定 -->
   <div id="settings">
     <h3 style="margin:4px 0">詳細設定</h3>
-    <label>数え方<span class="small">　v3「通過量」は、並んで通る人・斜めに通る人・立ち止まる人に強い方式（9/30の録画2本で、実際の人数の-4%〜+5%。少なすぎないよう少し多めに数えます）</span></label>
-    <select id="optMethod"><option value="flux" selected>通過量で数える（v3.2・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
+    <label>数え方<span class="small">　v3「通過量」は、並んで通る人・斜めに通る人・立ち止まる人に強い方式（9/30の録画で、実際の人数の+0%〜+6%。連れの塊は少し多めに数えます）</span></label>
+    <select id="optMethod"><option value="flux" selected>通過量で数える（v3.3・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
     <label>処理コマ数（毎秒）<span class="small">　v3は12推奨（8だと少し取りこぼしが増えます）</span></label>
     <select id="optFps"><option value="5">5</option><option value="8">8</option><option value="12" selected>12</option></select>
     <label>検出感度<span class="small">　影や照明の揺れを拾うなら「低」、人を見逃すなら「高」</span></label>
@@ -147,7 +147,7 @@ const LS = {
 };
 const CFG_DEF = { line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.2.1（9/30 1人分の学習を修正）";
+const VER = "頭上版 v3.3（9/30 連れの塊を少し多めに）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
@@ -583,7 +583,7 @@ function createFlux(o) {
   const P = Object.assign({
     W: 240, H: 180, sens: 25, shadow: true,
     R: 26, S: 12, bin: 4, lat: 4, thick: 1, occTh: 0.3, relTh: 0.5,
-    gapMs: 450, maxMs: 15000, A1: 780, minFrac: 0.3, roundOff: 0.5,
+    gapMs: 450, maxMs: 15000, A1: 780, minFrac: 0.2, roundOff: 0.5,   // v3.3: 0.3→0.2（暗い服で通過量が小さく出る人も拾う）
     learn: true, histN: 30, minHist: 5, learnQ: 0.35, learnRate: 0.3, A1min: 60, A1max: 20000,   // v3.2: 1人分を少し小さめに覚える（少し多めに数える）
     expo: true,
     // v3.1: 同時に通った人を「山の数」で分ける
@@ -592,6 +592,8 @@ function createFlux(o) {
     dupTh: 0, resetMs: 2000,
     // v3.1: 動かない前景（背景の作り直し残り・置き物）は、この時間で背景に取り込む
     staticMs: 6000,
+    // v3.3: 塊（連れ）は少し多めに。2秒以上かけて通り、1.3人分以上ある通過は最低2人と数える
+    clumpMs: 2000, clumpM: 1.3,
   }, o);
   const { W, H } = P, N = W * H;
   let bg = null, bgR, bgG, bgB;
@@ -740,6 +742,7 @@ function createFlux(o) {
       lobes = L.masses.length; const sc = mass / L.fpos; n = 0;
       for (const x of L.masses) { const xm = x * sc / a1; n += xm < P.two ? 1 : Math.floor(xm + 1 - P.ro2); }
     } else n = m < P.two ? 1 : Math.floor(m + 1 - P.ro2);
+    if (e.tEnd - e.tStart >= P.clumpMs && m >= P.clumpM) n = Math.max(n, 2);   // v3.3: 塊は少し多めに
     found.push({ dir, k: n, x0: e.x0, x1: e.x1, m, lobes });
     // 1人分の学習: 山が1つで、ふつうの大きさ（0.4〜1.6人分）で、行き来の少ない通過だけ使う
     if (P.learn && lobes === 1 && m > 0.4 && m < 1.6 && e.gross < mass * 1.6) {
