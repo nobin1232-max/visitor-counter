@@ -90,8 +90,8 @@
   <!-- 詳細設定 -->
   <div id="settings">
     <h3 style="margin:4px 0">詳細設定</h3>
-    <label>数え方<span class="small">　v3「通過量」は、並んで通る人・斜めに通る人・立ち止まる人に強い方式（9/30の69分の録画で入場144人中144人・退場85人中84人）</span></label>
-    <select id="optMethod"><option value="flux" selected>通過量で数える（v3.1・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
+    <label>数え方<span class="small">　v3「通過量」は、並んで通る人・斜めに通る人・立ち止まる人に強い方式（9/30の録画2本で、実際の人数の-4%〜+5%。少なすぎないよう少し多めに数えます）</span></label>
+    <select id="optMethod"><option value="flux" selected>通過量で数える（v3.2・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
     <label>処理コマ数（毎秒）<span class="small">　v3は12推奨（8だと少し取りこぼしが増えます）</span></label>
     <select id="optFps"><option value="5">5</option><option value="8">8</option><option value="12" selected>12</option></select>
     <label>検出感度<span class="small">　影や照明の揺れを拾うなら「低」、人を見逃すなら「高」</span></label>
@@ -147,7 +147,7 @@ const LS = {
 };
 const CFG_DEF = { line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.1（9/30 同時通過・止まり対策）";
+const VER = "頭上版 v3.2（9/30 少し多めに数える）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
@@ -584,7 +584,7 @@ function createFlux(o) {
     W: 240, H: 180, sens: 25, shadow: true,
     R: 26, S: 12, bin: 4, lat: 4, thick: 1, occTh: 0.3, relTh: 0.5,
     gapMs: 450, maxMs: 15000, A1: 780, minFrac: 0.3, roundOff: 0.5,
-    learn: true, histN: 30, minHist: 5, learnQ: 0.5, learnRate: 0.3, A1min: 60, A1max: 20000,
+    learn: true, histN: 30, minHist: 5, learnQ: 0.35,   // v3.2: 1人分を少し小さめに覚える（少し多めに数える） learnRate: 0.3, A1min: 60, A1max: 20000,
     expo: true,
     // v3.1: 同時に通った人を「山の数」で分ける
     lobe: true, lsx: 4, lst: 1.5, babs: 0.45, two: 1.8, ro2: 0.5,
