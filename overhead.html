@@ -163,7 +163,7 @@ const LS = {
 };
 const CFG_DEF = { lean: "more", line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.6（10/1 1人分の覚え方を修正）";
+const VER = "頭上版 v3.7（10/1 広角の補正：線の区間ごとに1人分を覚える）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v3.6: 1人分の覚え方を変えたので、以前に覚えた値は一度だけ捨てて覚え直す
@@ -617,6 +617,8 @@ function createFlux(o) {
     clumpMs: 2000, clumpM: 1.3,
     // v3.6: 線の上で行き来しただけ（揺れ・引き返し）の通過は、多くても1人と数える
     backMax: 4,
+    // v3.7: 広角の補正。線を区間に分け、区間ごとに「1人分」を覚える（画面の端ほど小さく写る分を合わせる）
+    zones: 3, zoneMin: 5,
   }, o);
   const { W, H } = P, N = W * H;
   let bg = null, bgR, bgG, bgB;
@@ -639,6 +641,9 @@ function createFlux(o) {
   const events = new Map(); let nextEv = 1;
   let A1 = P.A1; const massHist = [];
   const A1d = { in: P.A1, out: P.A1 }, hist = { in: [], out: [] };   // 向きごとの1人分（出る人は小さく写りやすい）
+  const zA = { in: [], out: [] }, zH = { in: [], out: [] };
+  for (const d of ['in', 'out']) for (let z = 0; z < (P.zones || 0); z++) { zA[d].push(0); zH[d].push([]); }
+  const zoneOf = (e) => Math.max(0, Math.min((P.zones || 1) - 1, Math.floor(((e.x0 + e.x1) / 2) / M * (P.zones || 1))));
   let calib = 0;          // 1: 次の通過を「1人分」として覚える
   let calibMsg = "";
   const stats = { events: 0, zero: 0 };
@@ -751,7 +756,9 @@ function createFlux(o) {
     events.delete(id);
     stats.events++;
     const mass = Math.abs(e.net), dir = e.net > 0 ? "in" : "out", sgn = e.net > 0 ? 1 : -1;
-    const a1 = (P.learn && hist[dir].length >= P.minHist) ? A1d[dir] : A1;
+    let a1 = (P.learn && hist[dir].length >= P.minHist) ? A1d[dir] : A1;
+    const zi = P.zones ? zoneOf(e) : -1;
+    if (zi >= 0 && P.learn && zH[dir][zi].length >= P.zoneMin) a1 = zA[dir][zi];   // v3.7: その区間で覚えた1人分
     A1cur = a1;
     const m = mass / a1;
     if (calib === 1 && mass > 150 && e.gross < mass * 1.6) {
@@ -775,6 +782,10 @@ function createFlux(o) {
       massHist.push(mass); if (massHist.length > P.histN) massHist.shift();
       const med = (arr) => { const v = arr.slice().sort((p, q) => p - q); return v[Math.floor(v.length * P.learnQ)]; };
       if (massHist.length >= P.minHist) A1 = Math.max(P.A1min, Math.min(P.A1max, A1 * (1 - P.learnRate) + med(massHist) * P.learnRate));
+      if (zi >= 0) {   // v3.7: 区間ごとにも覚える（はじめは全体の値から出発）
+        const zh = zH[dir][zi]; zh.push(mass); if (zh.length > P.histN) zh.shift();
+        if (zh.length >= P.zoneMin) zA[dir][zi] = Math.max(P.A1min, Math.min(P.A1max, (zA[dir][zi] || A1d[dir]) * (1 - P.learnRate) + med(zh) * P.learnRate));
+      }
       if (hs.length >= P.minHist) A1d[dir] = Math.max(P.A1min, Math.min(P.A1max, (hs.length === P.minHist ? A1 : A1d[dir]) * (1 - P.learnRate) + med(hs) * P.learnRate));
     }
   }
