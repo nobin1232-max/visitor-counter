@@ -90,8 +90,8 @@
   <!-- 詳細設定 -->
   <div id="settings">
     <h3 style="margin:4px 0">詳細設定</h3>
-    <label>数え方<span class="small">　v3「通過量」は、並んで通る人・立ち止まる人に強い方式（9/30の検証で入場33人中32人）</span></label>
-    <select id="optMethod"><option value="flux" selected>通過量で数える（v3・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
+    <label>数え方<span class="small">　v3「通過量」は、並んで通る人・斜めに通る人・立ち止まる人に強い方式（9/30の69分の録画で入場144人中144人・退場85人中84人）</span></label>
+    <select id="optMethod"><option value="flux" selected>通過量で数える（v3.1・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
     <label>処理コマ数（毎秒）<span class="small">　v3は12推奨（8だと少し取りこぼしが増えます）</span></label>
     <select id="optFps"><option value="5">5</option><option value="8">8</option><option value="12" selected>12</option></select>
     <label>検出感度<span class="small">　影や照明の揺れを拾うなら「低」、人を見逃すなら「高」</span></label>
@@ -147,7 +147,7 @@ const LS = {
 };
 const CFG_DEF = { line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.0（9/30 通過量方式）";
+const VER = "頭上版 v3.1（9/30 同時通過・止まり対策）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
@@ -586,10 +586,17 @@ function createFlux(o) {
     gapMs: 450, maxMs: 15000, A1: 780, minFrac: 0.3, roundOff: 0.5,
     learn: true, histN: 30, minHist: 5, learnQ: 0.5, learnRate: 0.3, A1min: 60, A1max: 20000,
     expo: true,
+    // v3.1: 同時に通った人を「山の数」で分ける
+    lobe: true, lsx: 4, lst: 1.5, babs: 0.45, two: 1.8, ro2: 0.5,
+    // v3.1: 映像が止まった（コマ落ち）ときの対策
+    dupTh: 0, resetMs: 2000,
+    // v3.1: 動かない前景（背景の作り直し残り・置き物）は、この時間で背景に取り込む
+    staticMs: 6000,
   }, o);
   const { W, H } = P, N = W * H;
   let bg = null, bgR, bgG, bgB;
-  const gray = new Float32Array(N), fg = new Uint8Array(N), fg2 = new Uint8Array(N);
+  const gray = new Float32Array(N), fg = new Uint8Array(N), fg2 = new Uint8Array(N), pg = new Float32Array(N), still = new Uint16Array(N);
+  let segT = 0, segDt = 83;
   let highSince = 0, fgRatio = 0;
   // 線（解析用の座標）。両端を15%のばして、画面の端を通る人も拾う
   const [a, b] = P.line; const f = 0.15, dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy) || 1;
@@ -602,10 +609,11 @@ function createFlux(o) {
   const Gc = new Float32Array(M * K), Gp = new Float32Array(M * K), Fc = new Uint8Array(M * K);
   const occ = new Float32Array(M), vel = new Float32Array(M), phi = new Float32Array(M);
   const lab = new Int32Array(M), prevLab = new Int32Array(M);
-  const costs = new Float64Array(2 * P.S + 1);
-  let havePrev = false, lastT = 0;
+  const costs = new Float64Array(2 * P.R + 1);
+  let havePrev = false, lastT = 0, fno = 0, lastProcT = 0, dtNom = 0;
   const events = new Map(); let nextEv = 1;
   let A1 = P.A1; const massHist = [];
+  const A1d = { in: P.A1, out: P.A1 }, hist = { in: [], out: [] };   // 向きごとの1人分（出る人は小さく写りやすい）
   let calib = 0;          // 1: 次の通過を「1人分」として覚える
   let calibMsg = "";
   const stats = { events: 0, zero: 0 };
@@ -639,13 +647,19 @@ function createFlux(o) {
           if (dc < 0.06) isFg = false;
         }
       }
-      if (isFg) { fg[i] = 1; cnt++; bg[i] += (gray[i] - bg[i]) * 0.002; }
+      if (isFg) {
+        fg[i] = 1; cnt++; bg[i] += (gray[i] - bg[i]) * 0.002;
+        // 動いていない前景が staticMs 続いたら背景に取り込む
+        if (P.staticMs && Math.abs(gray[i] - pg[i]) < 6) { if (++still[i] * segDt > P.staticMs) { bg[i] = gray[i]; bgR[i] = d[j]; bgG[i] = d[j + 1]; bgB[i] = d[j + 2]; still[i] = 0; } }
+        else still[i] = 0;
+      }
       else {
-        fg[i] = 0;
+        fg[i] = 0; still[i] = 0;
         if (diff > th) { bgR[i] += (d[j] - bgR[i]) * 0.002; bgG[i] += (d[j + 1] - bgG[i]) * 0.002; bgB[i] += (d[j + 2] - bgB[i]) * 0.002; }
         else { bg[i] += (gray[i] - bg[i]) * 0.05; bgR[i] += (d[j] - bgR[i]) * 0.05; bgG[i] += (d[j + 1] - bgG[i]) * 0.05; bgB[i] += (d[j + 2] - bgB[i]) * 0.05; }
       }
     }
+    pg.set(gray);
     for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
       const i = y * W + x;
       const c = fg[i - W - 1] + fg[i - W] + fg[i - W + 1] + fg[i - 1] + fg[i] + fg[i + 1] + fg[i + W - 1] + fg[i + W] + fg[i + W + 1];
@@ -656,29 +670,91 @@ function createFlux(o) {
     }
     return cnt / N;
   }
+  // 通過1回ぶんの「時間×線上の位置」の地図から、はっきり分かれた山（＝人）の数と、それぞれの量を求める
+  function lobeMasses(e, sgn) {
+    const rows = e.rows; if (!rows || !rows.length) return null;
+    let f0 = Infinity, f1 = -Infinity, x0 = Infinity, x1 = -Infinity;
+    for (const [f, i, ph] of rows) { if (f < f0) f0 = f; if (f > f1) f1 = f; if (i < x0) x0 = i; if (i + ph.length - 1 > x1) x1 = i + ph.length - 1; }
+    const T = f1 - f0 + 1, X = x1 - x0 + 1, NN = T * X; if (NN > 60000) return null;
+    const F = new Float32Array(NN);
+    for (const [f, i, ph] of rows) { const r = (f - f0) * X + (i - x0); for (let q = 0; q < ph.length; q++) { const v = ph[q] * sgn; if (v > 0) F[r + q] += v; } }
+    // ぼかし（横 lsx、縦 lst）
+    const blur = (src, w, h, sig, horiz) => {
+      const rad = Math.max(1, Math.ceil(sig * 2.5)), k = []; let ks = 0;
+      for (let d = -rad; d <= rad; d++) { const v = Math.exp(-d * d / (2 * sig * sig)); k.push(v); ks += v; }
+      const out = new Float32Array(w * h);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let s = 0; for (let d = -rad; d <= rad; d++) { const xx = horiz ? x + d : x, yy = horiz ? y : y + d;
+          if (xx >= 0 && xx < w && yy >= 0 && yy < h) s += src[yy * w + xx] * k[d + rad]; }
+        out[y * w + x] = s / ks;
+      }
+      return out;
+    };
+    const S = blur(blur(F, X, T, P.lsx, true), X, T, P.lst, false);
+    let mx = 0; for (let q = 0; q < NN; q++) if (S[q] > mx) mx = S[q];
+    let fpos = 0; for (let q = 0; q < NN; q++) fpos += F[q];
+    if (mx <= 0 || fpos <= 0) return null;
+    let best = [fpos];
+    const labl = new Int32Array(NN), own = new Int32Array(NN), queue = new Int32Array(NN);
+    for (const lv of [0.2, 0.3, 0.4, 0.5, 0.6]) {
+      labl.fill(0); let n = 0; const th = lv * mx;
+      for (let q = 0; q < NN; q++) {
+        if (S[q] < th || labl[q]) continue;
+        n++; let h = 0, t = 0; queue[t++] = q; labl[q] = n;
+        while (h < t) { const p = queue[h++], x = p % X;
+          if (x > 0 && !labl[p - 1] && S[p - 1] >= th) { labl[p - 1] = n; queue[t++] = p - 1; }
+          if (x < X - 1 && !labl[p + 1] && S[p + 1] >= th) { labl[p + 1] = n; queue[t++] = p + 1; }
+          if (p >= X && !labl[p - X] && S[p - X] >= th) { labl[p - X] = n; queue[t++] = p - X; }
+          if (p + X < NN && !labl[p + X] && S[p + X] >= th) { labl[p + X] = n; queue[t++] = p + X; } }
+      }
+      if (n <= best.length) continue;
+      // 残りの画素をいちばん近い山に割り当てる（幅優先で広げる）
+      own.set(labl); let h = 0, t = 0; for (let q = 0; q < NN; q++) if (own[q]) queue[t++] = q;
+      while (h < t) { const p = queue[h++], x = p % X, c = own[p];
+        if (x > 0 && !own[p - 1]) { own[p - 1] = c; queue[t++] = p - 1; }
+        if (x < X - 1 && !own[p + 1]) { own[p + 1] = c; queue[t++] = p + 1; }
+        if (p >= X && !own[p - X]) { own[p - X] = c; queue[t++] = p - X; }
+        if (p + X < NN && !own[p + X]) { own[p + X] = c; queue[t++] = p + X; } }
+      const ms = new Float64Array(n + 1); for (let q = 0; q < NN; q++) if (F[q] > 0) ms[own[q]] += F[q];
+      const sig = []; for (let c = 1; c <= n; c++) if (ms[c] >= P.babs * A1cur) sig.push(ms[c]);
+      if (sig.length > best.length) best = sig;
+    }
+    return { masses: best, fpos };
+  }
+  let A1cur = P.A1;
   function closeEvent(id, e, found) {
     events.delete(id);
     stats.events++;
-    const mass = Math.abs(e.net), m = mass / A1, dir = e.net > 0 ? "in" : "out";
-    if (calib === 1 && m * A1 > A1 * 0.2 && mass > 150 && e.gross < mass * 1.6) {
-      A1 = mass; massHist.length = 0; calib = 0; calibMsg = "1人分の通過量を覚えました";
+    const mass = Math.abs(e.net), dir = e.net > 0 ? "in" : "out", sgn = e.net > 0 ? 1 : -1;
+    const a1 = (P.learn && hist[dir].length >= P.minHist) ? A1d[dir] : A1;
+    A1cur = a1;
+    const m = mass / a1;
+    if (calib === 1 && mass > 150 && e.gross < mass * 1.6) {
+      A1 = mass; A1d.in = A1d.out = mass; hist.in.length = hist.out.length = 0; massHist.length = 0; calib = 0; calibMsg = "1人分の通過量を覚えました";
       found.push({ dir, k: 1, x0: e.x0, x1: e.x1, calib: true }); return;
     }
-    const n = m < P.minFrac ? 0 : Math.max(1, Math.floor(m + 1 - P.roundOff));
-    if (!n) { stats.zero++; return; }
-    found.push({ dir, k: n, x0: e.x0, x1: e.x1, m });
-    if (P.learn && m > 0.3 && e.gross < mass * 1.6) {
+    if (m < P.minFrac) { stats.zero++; return; }
+    let n, lobes = 1;
+    const L = P.lobe ? lobeMasses(e, sgn) : null;
+    if (L && L.masses.length > 1) {
+      lobes = L.masses.length; const sc = mass / L.fpos; n = 0;
+      for (const x of L.masses) { const xm = x * sc / a1; n += xm < P.two ? 1 : Math.floor(xm + 1 - P.ro2); }
+    } else n = m < P.two ? 1 : Math.floor(m + 1 - P.ro2);
+    found.push({ dir, k: n, x0: e.x0, x1: e.x1, m, lobes });
+    // 1人分の学習: 山が1つで、ふつうの大きさ（0.4〜1.6人分）で、行き来の少ない通過だけ使う
+    if (P.learn && lobes === 1 && m > 0.4 && m < 1.6 && e.gross < mass * 1.6) {
+      const hs = hist[dir]; hs.push(mass); if (hs.length > P.histN) hs.shift();
       massHist.push(mass); if (massHist.length > P.histN) massHist.shift();
-      if (massHist.length >= P.minHist) {
-        const v = massHist.slice().sort((p, q) => p - q), q = v[Math.floor(v.length * P.learnQ)];
-        A1 = Math.max(P.A1min, Math.min(P.A1max, A1 * (1 - P.learnRate) + q * P.learnRate));
-      }
+      const med = (arr) => { const v = arr.slice().sort((p, q) => p - q); return v[Math.floor(v.length * P.learnQ)]; };
+      if (massHist.length >= P.minHist) A1 = Math.max(P.A1min, Math.min(P.A1max, A1 * (1 - P.learnRate) + med(massHist) * P.learnRate));
+      if (hs.length >= P.minHist) A1d[dir] = Math.max(P.A1min, Math.min(P.A1max, (hs.length === P.minHist ? A1 : A1d[dir]) * (1 - P.learnRate) + med(hs) * P.learnRate));
     }
   }
   function reset() { bg = null; events.clear(); havePrev = false; lab.fill(0); prevLab.fill(0); }
   // d: RGBAの画素（W×H）、t: ミリ秒。戻り値: このコマで確定した通過 [{dir, k, x0, x1}]
   function step(d, t) {
     const found = [];
+    if (segT && t > segT && t - segT < 1000) segDt = segDt * 0.9 + (t - segT) * 0.1; segT = t;
     if (lastT && t - lastT > 1500) {   // 画面が消えていた等で間が空いた → 途中の通過は捨てて出直す
       for (const [id, e] of [...events]) closeEvent(id, e, found);
       havePrev = false;
@@ -686,7 +762,7 @@ function createFlux(o) {
     const fr = segFg(d); if (fr === false) { lastT = t; return found; }
     fgRatio = fr;
     // カメラが動いた・照明が激変した → 数秒続いたら背景を作り直す
-    if (fr > 0.6) { if (!highSince) highSince = t; else if (t - highSince > 4000) { reset(); highSince = 0; lastT = t; return found; } }
+    if (fr > 0.6) { if (!highSince) highSince = t; else if (t - highSince > P.resetMs) { reset(); highSince = 0; lastT = t; return found; } }
     else highSince = 0;
     for (let i = 0; i < M; i++) {
       const p = pts[i];
@@ -697,12 +773,20 @@ function createFlux(o) {
         Fc[idx] = (xi >= 0 && xi < W && yi >= 0 && yi < H) ? fg[yi * W + xi] : 0;
       }
     }
+    // 映像が止まっている（前のコマとほぼ同じ）ときは、このコマを使わない。通過中の人は保留のまま
+    if (havePrev && P.dupTh > 0) {
+      let dsum = 0; for (let q = 0; q < M * K; q += 3) dsum += Math.abs(Gc[q] - Gp[q]);
+      if (dsum / (M * K / 3) < P.dupTh) { for (const e of events.values()) e.tEnd = t; lastT = t; return found; }
+    }
     for (let i = 0; i < M; i++) { let s = 0, c = 0; for (let k = -P.thick; k <= P.thick; k++) { s += Fc[i * K + k + R]; c++; } occ[i] = s / c; }
-    lastT = t;
+    // コマの間隔が空いた（止まっていた）ぶんだけ、動きを探す範囲を広げる
+    const dtp = lastProcT ? t - lastProcT : 0; if (dtp > 0 && dtp < 400) dtNom = dtNom ? dtNom * 0.95 + Math.min(dtp, dtNom * 1.5) * 0.05 : dtp;
+    const Sx = havePrev && dtNom && dtp > dtNom * 1.6 ? Math.min(R - 8, Math.round(P.S * Math.min(3, dtp / dtNom))) : P.S;
+    lastT = t; lastProcT = t; fno++;
     // 線の上の動き（線と直角方向に何画素動いたか）を、前のコマとの照合で求める
     vel.fill(0);
     if (havePrev) {
-      const S = P.S, bin = P.bin, lat = P.lat;
+      const S = Sx, bin = P.bin, lat = P.lat;
       for (let b0 = 0; b0 < M; b0 += bin) {
         let any = false; for (let i = b0; i < Math.min(M, b0 + bin); i++) if (occ[i] > 0) { any = true; break; }
         if (!any) continue;
@@ -737,12 +821,13 @@ function createFlux(o) {
       else {
         id = idl[0]; const e = events.get(id);
         for (const o2 of idl.slice(1)) {
-          const e2 = events.get(o2); e.net += e2.net; e.gross += e2.gross; e.x0 = Math.min(e.x0, e2.x0); e.x1 = Math.max(e.x1, e2.x1); e.tStart = Math.min(e.tStart, e2.tStart);
+          const e2 = events.get(o2); e.net += e2.net; e.gross += e2.gross; e.x0 = Math.min(e.x0, e2.x0); e.x1 = Math.max(e.x1, e2.x1); e.tStart = Math.min(e.tStart, e2.tStart); if (e2.rows) e.rows = (e.rows || []).concat(e2.rows);
           events.delete(o2); for (let q = 0; q < M; q++) if (lab[q] === o2) lab[q] = id;
         }
       }
       const e = events.get(id);
       for (let q = i; q <= j; q++) { lab[q] = id; e.net += phi[q]; e.gross += Math.abs(phi[q]); }
+      if (P.lobe) (e.rows || (e.rows = [])).push([fno, i, phi.slice(i, j + 1)]);
       e.x0 = Math.min(e.x0, i); e.x1 = Math.max(e.x1, j); e.tEnd = t;
       i = j + 1;
     }
@@ -752,7 +837,8 @@ function createFlux(o) {
   }
   return {
     step, reset, pts, occ, vel, occTh: P.occTh,
-    get A1() { return A1; }, set A1(v) { A1 = v; },
+    get A1() { return A1; }, set A1(v) { A1 = v; A1d.in = A1d.out = v; },
+    get A1in() { return A1d.in; }, get A1out() { return A1d.out; },
     get samples() { return massHist.length; },
     get fgRatio() { return fgRatio; }, get active() { return events.size; },
     armCalib() { calib = 1; calibMsg = "1人だけで線を横切ってください（覚えるまで待機中）"; },
@@ -1054,7 +1140,7 @@ async function tick() {
 function renderStatus() {
   const ev = cfg.evidence ? `  証拠 ${evCount}枚` : "";
   const who = isFlux()
-    ? `1人分(通過量) ${fluxer ? Math.round(fluxer.A1) : (cfg.a1 || "未")}${fluxer && fluxer.samples < 5 && !cfg.a1 ? "（学習中）" : ""}${fluxer && fluxer.calibMsg ? "  ★" + fluxer.calibMsg : ""}`
+    ? `1人分(通過量) 入${fluxer ? Math.round(fluxer.A1in) : (cfg.a1 || "未")}/出${fluxer ? Math.round(fluxer.A1out) : (cfg.a1 || "未")}${fluxer && fluxer.samples < 5 && !cfg.a1 ? "（学習中）" : ""}${fluxer && fluxer.calibMsg ? "  ★" + fluxer.calibMsg : ""}`
     : `1人分 ${typicalArea ? (typicalArea / (BW * BH) * 100).toFixed(1) + "%" : "未学習"}  追跡中 ${tracks.size}`;
   const s = `${VER}  ${vw}×${vh}  処理 ${inferMs.toFixed(1)}ms/コマ  コマ ${processed}  前景 ${(fgRatio * 100).toFixed(0)}%  ${who}` +
     ev + (cfg.url ? `  送信 ${lastSendAt ? new Date(lastSendAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "未"}` : "  送信なし（端末内保存）");
@@ -1102,6 +1188,7 @@ async function keepAwake() { try { wakeLock = await navigator.wakeLock?.request(
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
   keepAwake(); if (video.paused) video.play().catch(() => {});
+  if (mode === "run" && fluxer) fluxer.reset();   // 他のアプリから戻ったときは背景を作り直す
   if (hiddenAt) {
     const sec = Math.round((Date.now() - hiddenAt) / 1000);
     // 15秒を超える中断は「計測が止まっていた時間」として記録する（画面オフ・他アプリ切替）
