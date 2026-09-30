@@ -40,6 +40,14 @@
   #settings input[type=text], #settings input[type=url] { width: 100%; }
   textarea { width: 100%; height: 160px; background: #1a1a1a; color: #ddd; border: 1px solid #444; border-radius: 8px; font-size: 12px; }
   .small { font-size: 12px; color: #888; }
+  .manual { display: flex; justify-content: space-around; gap: 8px; padding: 4px 8px 6px; }
+  .mg { display: flex; gap: 6px; }
+  .mg button { border-radius: 12px; }
+  .mg .mp { font-size: 20px; font-weight: 700; padding: 14px 20px; color: #fff; }
+  .mg.in .mp { background: #1f4d2a; border-color: #4cd964; } .mg.out .mp { background: #5a3a10; border-color: #ff9f0a; }
+  .mg .mm { font-size: 16px; padding: 14px 12px; color: #bbb; }
+  .mg .mp.flash { filter: brightness(1.8); }
+  #manTxt { font-size: 13px; color: #9ad; text-align: center; padding: 0 12px 6px; display: none; }
   #rep { font-size: 13px; color: #9ad; padding: 2px 12px 8px; line-height: 1.5; }
   #gap { display: none; margin: 0 12px 8px; padding: 8px 10px; border-radius: 8px;
     background: #3a2a10; border: 1px solid #7a5a20; color: #ffd08a; font-size: 13px; line-height: 1.5; }
@@ -71,6 +79,12 @@
       <div class="c in"><div class="n" id="nIn">0</div><div class="l">入場</div></div>
       <div class="c out"><div class="n" id="nOut">0</div><div class="l">退場</div></div>
     </div>
+    <!-- v3.4: 手動で足す・引くボタン（数え漏れを見たとき用） -->
+    <div class="manual">
+      <div class="mg in"><button id="mInMinus" class="mm" title="入場を1減らす">−1</button><button id="mInPlus" class="mp">入場 ＋1</button></div>
+      <div class="mg out"><button id="mOutPlus" class="mp">退場 ＋1</button><button id="mOutMinus" class="mm" title="退場を1減らす">−1</button></div>
+    </div>
+    <div id="manTxt"></div>
     <div id="rep"></div>
     <div id="gap"></div>
     <div class="status" id="status"></div>
@@ -91,7 +105,9 @@
   <div id="settings">
     <h3 style="margin:4px 0">詳細設定</h3>
     <label>数え方<span class="small">　v3「通過量」は、並んで通る人・斜めに通る人・立ち止まる人に強い方式（9/30の録画で、実際の人数の+0%〜+6%。連れの塊は少し多めに数えます）</span></label>
-    <select id="optMethod"><option value="flux" selected>通過量で数える（v3.3・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
+    <select id="optMethod"><option value="flux" selected>通過量で数える（v3.4・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
+    <label>多めに数えるか<span class="small">　通過量（v3）のときだけ。「多め」は連れの塊や暗い服の人を多めに拾う（録画で全体+4%、塊ごとに最大+2人）。「ふつう」は数えすぎを抑える（少なめに出やすい）</span></label>
+    <select id="optLean"><option value="more" selected>多め（おすすめ・v3.3）</option><option value="some">少し多め（v3.2）</option><option value="normal">ふつう（v3.1）</option></select>
     <label>処理コマ数（毎秒）<span class="small">　v3は12推奨（8だと少し取りこぼしが増えます）</span></label>
     <select id="optFps"><option value="5">5</option><option value="8">8</option><option value="12" selected>12</option></select>
     <label>検出感度<span class="small">　影や照明の揺れを拾うなら「低」、人を見逃すなら「高」</span></label>
@@ -145,9 +161,9 @@ const LS = {
   get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
-const CFG_DEF = { line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
+const CFG_DEF = { lean: "more", line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.3（9/30 連れの塊を少し多めに）";
+const VER = "頭上版 v3.4（9/30 手動＋1・多めの設定）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
@@ -852,12 +868,18 @@ function createFlux(o) {
 }
 
 let fluxer = null, fluxSavedAt = 0;
+// v3.4: 「多めに数えるか」の設定ごとの中身
+const LEAN = {
+  more:   { learnQ: 0.35, minFrac: 0.2, clumpMs: 2000 },   // 多め（v3.3）
+  some:   { learnQ: 0.35, minFrac: 0.3, clumpMs: 1e12 },   // 少し多め（v3.2）
+  normal: { learnQ: 0.5,  minFrac: 0.3, clumpMs: 1e12 },   // ふつう（v3.1）
+};
 const isFlux = () => cfg.method !== "track";
 function makeFluxer() {
   if (!cfg.line || !vw) { fluxer = null; return; }
   const k = BW / vw, ky = BH / vh;
   fluxer = createFlux({ W: BW, H: BH, line: cfg.line.map((p) => ({ x: p.x * k, y: p.y * ky })), flip: cfg.flip,
-    sens: cfg.sens, shadow: cfg.shadow, A1: cfg.a1 || Math.round(780 * (BW * BH) / 43200) });
+    sens: cfg.sens, shadow: cfg.shadow, A1: cfg.a1 || Math.round(780 * (BW * BH) / 43200), ...LEAN[cfg.lean || "more"] });
 }
 function tickFlux(now) {
   if (!fluxer) makeFluxer(); if (!fluxer) return;
@@ -1025,6 +1047,26 @@ function renderCounts() {
   $("nIn").textContent = data.totalIn; $("nOut").textContent = data.totalOut;
   $("miniCount").textContent = `${data.totalIn} / ${data.totalOut}`;
   if ($("rep")) $("rep").textContent = repText();
+  const mi = data.manIn || 0, mo = data.manOut || 0, el = $("manTxt");
+  if (el) { el.style.display = (mi || mo) ? "block" : "none"; const f = (v) => (v > 0 ? "+" : v < 0 ? "−" : "±") + Math.abs(v); el.textContent = `うち手動で直した分: 入場 ${f(mi)} ／ 退場 ${f(mo)}`; }
+}
+// v3.4: 手動で足す（delta=+1）・引く（delta=-1）。数え漏れ・数えすぎを見たときに使う
+function manualAdjust(dir, delta) {
+  const key = dir === "in" ? "totalIn" : "totalOut", mkey = dir === "in" ? "manIn" : "manOut";
+  if (delta < 0 && data[key] <= 0) return;
+  const d = new Date();
+  const hour = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
+  if (delta > 0) { data.hourly[hour] = data.hourly[hour] || { in: 0, out: 0 }; data.hourly[hour][dir]++; }
+  else { // 引くときは、数が残っている一番新しい時間帯から引く
+    const hs = Object.keys(data.hourly).sort().reverse().find((h) => data.hourly[h][dir] > 0);
+    if (hs) data.hourly[hs][dir]--;
+  }
+  data[key] += delta; data[mkey] = (data[mkey] || 0) + delta;
+  data.events.push([d.toISOString(), dir, 0, delta > 0 ? "手動+1" : "手動-1"]);
+  if (data.events.length > 5000) data.events.splice(0, data.events.length - 5000);
+  LS.set("vc_data_oh", data);
+  renderCounts();
+  const b = $(dir === "in" ? "mInPlus" : "mOutPlus"); if (b && delta > 0) { b.classList.add("flash"); setTimeout(() => b.classList.remove("flash"), 200); }
 }
 async function tick() {
   if (mode !== "run" || paused || !detector || video.readyState < 2) return;
@@ -1169,8 +1211,9 @@ function csvText() {
   for (const h of Object.keys(data.hourly).sort()) t += `${h},${data.hourly[h].in},${data.hourly[h].out}\n`;
   t += `合計,${data.totalIn},${data.totalOut}\n`;
   t += `同一人物らしき再通過,${data.repIn || 0},${data.repOut || 0}\n`;
-  t += `再通過を除いた推定,${data.totalIn - (data.repIn || 0)},${data.totalOut - (data.repOut || 0)}\n\n時刻,向き,同一人物らしき\n`;
-  for (const [ts, dir, rep] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"},${rep ? "○" : ""}\n`;
+  t += `再通過を除いた推定,${data.totalIn - (data.repIn || 0)},${data.totalOut - (data.repOut || 0)}\n`;
+  t += `うち手動で直した分,${data.manIn || 0},${data.manOut || 0}\n\n時刻,向き,同一人物らしき,手動\n`;
+  for (const [ts, dir, rep, man] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"},${rep ? "○" : ""},${man || ""}\n`;
   if (gaps.length) {
     t += `\n計測が止まっていた時間,長さ(秒)\n`;
     for (const [ts, sec] of gaps) t += `${new Date(ts).toLocaleString("ja-JP")},${sec}\n`;
@@ -1215,7 +1258,7 @@ function showSetup() {
 function showSettings() {
   mode = "settings"; clearInterval(timer); $("run").style.display = "none"; $("setupBar").style.display = "none"; $("stage").style.display = "none";
   $("settings").style.display = "block";
-  $("optMethod").value = cfg.method || "flux"; $("optFps").value = cfg.fps; $("optSens").value = cfg.sens; $("optMin").value = cfg.minPct; $("optSplit").value = cfg.split ? "1" : "0"; $("optShadow").value = cfg.shadow ? "1" : "0";
+  $("optMethod").value = cfg.method || "flux"; $("optLean").value = cfg.lean || "more"; $("optFps").value = cfg.fps; $("optSens").value = cfg.sens; $("optMin").value = cfg.minPct; $("optSplit").value = cfg.split ? "1" : "0"; $("optShadow").value = cfg.shadow ? "1" : "0";
   $("optCool").value = cfg.cool; $("optRepWin").value = cfg.repWin; $("optRepTh").value = cfg.repTh;
   $("optEvid").value = cfg.evidence ? "1" : "0"; $("optEvEvery").value = cfg.evEvery; $("optEvMax").value = cfg.evMax;
   $("optUrl").value = cfg.url; $("optToken").value = cfg.token; $("optInterval").value = cfg.interval; $("optName").value = cfg.name;
@@ -1231,7 +1274,7 @@ $("btnStart").onclick = () => { if (!cfg.line) { alert("先にラインを引い
 $("btnStop").onclick = showSetup;
 $("btnSettings").onclick = showSettings;
 $("btnSaveSettings").onclick = () => {
-  const newMethod = $("optMethod").value; cfg.method = newMethod; cfg.fps = +$("optFps").value; cfg.sens = +$("optSens").value; cfg.minPct = +$("optMin").value; cfg.split = $("optSplit").value === "1"; cfg.shadow = $("optShadow").value === "1";
+  const newMethod = $("optMethod").value; cfg.method = newMethod; cfg.lean = $("optLean").value; cfg.fps = +$("optFps").value; cfg.sens = +$("optSens").value; cfg.minPct = +$("optMin").value; cfg.split = $("optSplit").value === "1"; cfg.shadow = $("optShadow").value === "1";
   cfg.cool = +$("optCool").value; cfg.repWin = +$("optRepWin").value; cfg.repTh = +$("optRepTh").value;
   cfg.evidence = $("optEvid").value === "1"; cfg.evEvery = +$("optEvEvery").value; cfg.evMax = +$("optEvMax").value;
   cfg.url = $("optUrl").value.trim(); cfg.token = $("optToken").value.trim(); cfg.interval = +$("optInterval").value; cfg.name = $("optName").value.trim() || "入口1";
@@ -1241,9 +1284,12 @@ $("btnSaveSettings").onclick = () => {
   if (camChanged) startCamera().then(() => { loadModel(); drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
   showSetup();
 };
-$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, hourly: {}, events: [] }; recentSigs = []; LS.set("vc_data_oh", data); gaps = []; LS.set("vc_gaps_oh", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
+$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, manIn: 0, manOut: 0, hourly: {}, events: [] }; recentSigs = []; LS.set("vc_data_oh", data); gaps = []; LS.set("vc_gaps_oh", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
 $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
 $("btnDim").onclick = () => { $("dim").style.display = "block"; };
+$("mInPlus").onclick = () => manualAdjust("in", 1); $("mOutPlus").onclick = () => manualAdjust("out", 1);
+$("mInMinus").onclick = () => { if (confirm("入場を1減らしますか？")) manualAdjust("in", -1); };
+$("mOutMinus").onclick = () => { if (confirm("退場を1減らしますか？")) manualAdjust("out", -1); };
 $("btnRelearn").onclick = () => { relearnBackground(); };
 $("btnOne").onclick = () => {
   if (isFlux()) {
