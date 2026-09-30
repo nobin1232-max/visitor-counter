@@ -163,7 +163,7 @@ const LS = {
 };
 const CFG_DEF = { lean: "more", line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.4（9/30 手動＋1・多めの設定）";
+const VER = "頭上版 v3.5（9/30 要確認の記録）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
@@ -290,13 +290,13 @@ function keepPrev() {
   prevCv.width = SNAP_W; prevCv.height = h;
   try { prevCx.drawImage(video, 0, 0, SNAP_W, h); prevReady = true; } catch {}
 }
-function evSaveEvent(dir, k, bb, rep) {
+function evSaveEvent(dir, k, bb, rep, chk) {
   if (!cfg.evidence) return;
   const before = prevReady ? prevCv.toDataURL("image/jpeg", 0.5) : null;
   const after = snapNow(bb);
   if (!after) return;
   evPut({ ts: Date.now(), kind: "count", dir, k: k || 1, rep: rep ? 1 : 0, repTs: rep ? rep.ts : null,
-          repD: rep ? rep.d : null, repMin: rep ? rep.min : null, repDir: rep ? rep.dir : null, before, after });
+          repD: rep ? rep.d : null, repMin: rep ? rep.min : null, repDir: rep ? rep.dir : null, chk: chk || "", before, after });
 }
 let lastPeriodic = 0;
 function evPeriodic() {
@@ -325,6 +325,7 @@ async function evExport() {
     const hour = new Date(r.ts).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit" });
     if (hour !== lastHour) { rows += `<h2>${esc(hour)}台</h2>`; lastHour = hour; }
     let label = r.kind === "periodic" ? "定点" : (r.dir === "in" ? "入場" : "退場") + (r.k > 1 ? ` ×${r.k}` : "");
+    if (r.chk) label += `　<span class="rep">要確認: ${esc(r.chk)}</span>`;
     if (r.rep) label += `　<span class="rep">同じ人かも: ${r.repMin || "?"}分前に${r.repDir === "in" ? "入った" : "出た"}人と似ています（${esc(jp(r.repTs))} ／ 似ている度 ${r.repD}）</span>`;
     const cls = r.kind === "periodic" ? "p" : (r.dir === "in" ? "in" : "out");
     rows += `<div class="c ${cls}"><div class="t">${esc(jp(r.ts))}　<b>${label}</b></div><div class="i">` +
@@ -442,9 +443,11 @@ function checkRepeat(sigs, dir, ts) {
 }
 function repText() {
   const r = (data.repIn || 0) + (data.repOut || 0);
-  if (!cfg.repWin || cfg.method !== "track") return "";
-  if (!r) return "同一人物らしき再通過: 0件";
-  return `同一人物らしき再通過: ${r}件（入場${data.repIn || 0}・退場${data.repOut || 0}）　→ 除いた推定: 入場 ${data.totalIn - (data.repIn || 0)} ／ 退場 ${data.totalOut - (data.repOut || 0)}`;
+  let s = "";
+  if (cfg.method !== "track") s = `要確認: 入場${data.chkIn || 0}・退場${data.chkOut || 0}`;   // v3.5
+  if (cfg.repWin) s += (s ? "　" : "") + (!r ? "同一人物らしき再通過: 0件"
+    : `同一人物らしき再通過: ${r}件（入場${data.repIn || 0}・退場${data.repOut || 0}）　→ 除いた推定: 入場 ${data.totalIn - (data.repIn || 0)} ／ 退場 ${data.totalOut - (data.repOut || 0)}`);
+  return s;
 }
 
 let mode = "setup";          // setup | run | settings
@@ -759,7 +762,7 @@ function createFlux(o) {
       for (const x of L.masses) { const xm = x * sc / a1; n += xm < P.two ? 1 : Math.floor(xm + 1 - P.ro2); }
     } else n = m < P.two ? 1 : Math.floor(m + 1 - P.ro2);
     if (e.tEnd - e.tStart >= P.clumpMs && m >= P.clumpM) n = Math.max(n, 2);   // v3.3: 塊は少し多めに
-    found.push({ dir, k: n, x0: e.x0, x1: e.x1, m, lobes });
+    found.push({ dir, k: n, x0: e.x0, x1: e.x1, m, lobes, dur: e.tEnd - e.tStart, back: mass > 0 ? e.gross / mass : 1 });   // v3.5: 要確認の判定用に、通過にかかった時間と行き来の多さも渡す
     // 1人分の学習: 山が1つで、ふつうの大きさ（0.4〜1.6人分）で、行き来の少ない通過だけ使う
     if (P.learn && lobes === 1 && m > 0.4 && m < 1.6 && e.gross < mass * 1.6) {
       const hs = hist[dir]; hs.push(mass); if (hs.length > P.histN) hs.shift();
@@ -868,6 +871,19 @@ function createFlux(o) {
 }
 
 let fluxer = null, fluxSavedAt = 0;
+// v3.5: 「要確認」の印。数は減らさず、怪しい通過に理由を付けるだけ
+const CHK_BACK_MS = 10000;   // この秒数以内に、線の同じあたりを逆向きに通ったら「引き返し」の疑い
+let recentPass = [];
+function markChk(p, why) {
+  if (!p || !p.recs) return;
+  let changed = false;
+  for (const r of p.recs) {
+    if (r[4]) continue;
+    r[4] = why; changed = true;
+    if (r[1] === "in") data.chkIn = (data.chkIn || 0) + 1; else data.chkOut = (data.chkOut || 0) + 1;
+  }
+  if (changed) { LS.set("vc_data_oh", data); renderCounts(); }
+}
 // v3.4: 「多めに数えるか」の設定ごとの中身
 const LEAN = {
   more:   { learnQ: 0.35, minFrac: 0.2, clumpMs: 2000 },   // 多め（v3.3）
@@ -899,7 +915,21 @@ function tickFlux(now) {
     const p0 = fluxer.pts[c.x0], p1 = fluxer.pts[c.x1];
     const bb = { originX: Math.min(p0.x, p1.x) * kx - 20, originY: Math.min(p0.y, p1.y) * ky - vh * 0.12, width: Math.abs(p1.x - p0.x) * kx + 40, height: vh * 0.24 };
     if (c.calib) { cfg.a1 = Math.round(fluxer.A1); LS.set("vc_cfg_oh", cfg); renderStatus(); continue; }
-    record(c.dir, c.k, null); evSaveEvent(c.dir, c.k, bb, null);
+    // v3.5: 要確認の判定（数は変えない）
+    const tNow = Date.now(), chk = [];
+    if (c.k >= 2) chk.push(`塊→${c.k}人`);
+    if (c.dur >= 4000) chk.push(`線の上に${Math.round(c.dur / 1000)}秒`);
+    if (c.m < 0.5) chk.push("小さい通過");
+    if (c.back > 2) chk.push("線の上で行き来");
+    recentPass = recentPass.filter((p) => tNow - p.t <= CHK_BACK_MS);
+    const opp = recentPass.find((p) => p.dir !== c.dir && c.x0 <= p.x1 + 8 && c.x1 >= p.x0 - 8);
+    if (opp) { chk.push(`${Math.max(1, Math.round((tNow - opp.t) / 1000))}秒前に逆向き`); markChk(opp, "直後に逆向きの通過"); }
+    // 同一人物らしき再通過（服の色）: 1人の通過だけ照合する（参考）
+    let rep = null;
+    if (cfg.repWin && c.k === 1) { const s = makeSig(bb); if (s) rep = checkRepeat([s], c.dir, tNow); }
+    const why = chk.join("・");
+    record(c.dir, c.k, rep, why); evSaveEvent(c.dir, c.k, bb, rep, why);
+    recentPass.push({ t: tNow, dir: c.dir, x0: c.x0, x1: c.x1, recs: data.events.slice(-c.k) });
     $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600);
     if (c.k > 1) { ctx.fillStyle = "#fff"; ctx.font = "bold 28px sans-serif"; ctx.fillText(`${c.k}人`, bb.originX + bb.width / 2, bb.originY); }
   }
@@ -1030,15 +1060,16 @@ function updateTrack(id, pt, now) {
   t.pt = pt; t.lastSide = s; t.seen = now;
   return dir;
 }
-function record(dir, k = 1, rep) {
+function record(dir, k = 1, rep, chk) {
   const d = new Date();
-  if (k > 1) { for (let i = 0; i < k; i++) record(dir, 1, i === 0 ? rep : null); return; }
+  if (k > 1) { for (let i = 0; i < k; i++) record(dir, 1, i === 0 ? rep : null, chk); return; }
   if (rep) { if (dir === "in") data.repIn = (data.repIn || 0) + 1; else data.repOut = (data.repOut || 0) + 1; }
+  if (chk) { if (dir === "in") data.chkIn = (data.chkIn || 0) + 1; else data.chkOut = (data.chkOut || 0) + 1; }
   const hour = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
   data.hourly[hour] = data.hourly[hour] || { in: 0, out: 0 };
   data.hourly[hour][dir]++;
   if (dir === "in") data.totalIn++; else data.totalOut++;
-  data.events.push([d.toISOString(), dir, rep ? 1 : 0]);
+  data.events.push([d.toISOString(), dir, rep ? 1 : 0, "", chk || ""]);
   if (data.events.length > 5000) data.events.splice(0, data.events.length - 5000);
   LS.set("vc_data_oh", data);
   renderCounts();
@@ -1212,8 +1243,9 @@ function csvText() {
   t += `合計,${data.totalIn},${data.totalOut}\n`;
   t += `同一人物らしき再通過,${data.repIn || 0},${data.repOut || 0}\n`;
   t += `再通過を除いた推定,${data.totalIn - (data.repIn || 0)},${data.totalOut - (data.repOut || 0)}\n`;
-  t += `うち手動で直した分,${data.manIn || 0},${data.manOut || 0}\n\n時刻,向き,同一人物らしき,手動\n`;
-  for (const [ts, dir, rep, man] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"},${rep ? "○" : ""},${man || ""}\n`;
+  t += `うち手動で直した分,${data.manIn || 0},${data.manOut || 0}\n`;
+  t += `要確認の通過（数は減らしていない）,${data.chkIn || 0},${data.chkOut || 0}\n\n時刻,向き,同一人物らしき,手動,要確認\n`;
+  for (const [ts, dir, rep, man, chk] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"},${rep ? "○" : ""},${man || ""},${chk || ""}\n`;
   if (gaps.length) {
     t += `\n計測が止まっていた時間,長さ(秒)\n`;
     for (const [ts, sec] of gaps) t += `${new Date(ts).toLocaleString("ja-JP")},${sec}\n`;
@@ -1284,7 +1316,7 @@ $("btnSaveSettings").onclick = () => {
   if (camChanged) startCamera().then(() => { loadModel(); drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
   showSetup();
 };
-$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, manIn: 0, manOut: 0, hourly: {}, events: [] }; recentSigs = []; LS.set("vc_data_oh", data); gaps = []; LS.set("vc_gaps_oh", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
+$("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, manIn: 0, manOut: 0, chkIn: 0, chkOut: 0, hourly: {}, events: [] }; recentSigs = []; recentPass = []; LS.set("vc_data_oh", data); gaps = []; LS.set("vc_gaps_oh", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
 $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
 $("btnDim").onclick = () => { $("dim").style.display = "block"; };
 $("mInPlus").onclick = () => manualAdjust("in", 1); $("mOutPlus").onclick = () => manualAdjust("out", 1);
