@@ -78,7 +78,7 @@
     <div class="bar">
       <button id="btnDim">画面を暗く</button>
       <button id="btnRelearn">背景を学習し直す</button>
-      <button id="btnOne">1人分の大きさを記憶</button>
+      <button id="btnOne">1人分を覚えさせる</button>
       <button id="btnPause">一時停止</button>
       <button id="btnCsv">CSV/共有</button>
       <button id="btnEvid">証拠を書き出す</button>
@@ -90,8 +90,10 @@
   <!-- 詳細設定 -->
   <div id="settings">
     <h3 style="margin:4px 0">詳細設定</h3>
-    <label>処理コマ数（毎秒）<span class="small">　少ないほど発熱が小さい。3〜5推奨</span></label>
-    <select id="optFps"><option value="5">5</option><option value="8" selected>8</option><option value="12">12</option></select>
+    <label>数え方<span class="small">　v3「通過量」は、並んで通る人・立ち止まる人に強い方式（9/30の検証で入場33人中32人）</span></label>
+    <select id="optMethod"><option value="flux" selected>通過量で数える（v3・おすすめ）</option><option value="track">人を追いかけて数える（v2.2・従来）</option></select>
+    <label>処理コマ数（毎秒）<span class="small">　v3は12推奨（8だと少し取りこぼしが増えます）</span></label>
+    <select id="optFps"><option value="5">5</option><option value="8">8</option><option value="12" selected>12</option></select>
     <label>検出感度<span class="small">　影や照明の揺れを拾うなら「低」、人を見逃すなら「高」</span></label>
     <select id="optSens"><option value="35">低</option><option value="25" selected>標準</option><option value="16">高</option></select>
     <label>人として扱う最小の大きさ<span class="small">　画面に占める割合。カメラが高いほど小さく</span></label>
@@ -143,9 +145,9 @@ const LS = {
   get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
-const CFG_DEF = { line: null, flip: false, fps: 8, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
+const CFG_DEF = { line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v2.2（9/29 見つかるのが遅れた人も数える）";
+const VER = "頭上版 v3.0（9/30 通過量方式）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v2: 解析の細かさを 160→240 にしたので、記憶済みの「1人分」を同じ比率で直す
@@ -424,7 +426,7 @@ function checkRepeat(sigs, dir, ts) {
 }
 function repText() {
   const r = (data.repIn || 0) + (data.repOut || 0);
-  if (!cfg.repWin) return "";
+  if (!cfg.repWin || cfg.method !== "track") return "";
   if (!r) return "同一人物らしき再通過: 0件";
   return `同一人物らしき再通過: ${r}件（入場${data.repIn || 0}・退場${data.repOut || 0}）　→ 除いた推定: 入場 ${data.totalIn - (data.repIn || 0)} ／ 退場 ${data.totalOut - (data.repOut || 0)}`;
 }
@@ -472,7 +474,7 @@ async function loadModel() {
   gray = new Float32Array(BW * BH); fg = new Uint8Array(BW * BH); absorb = new Uint8Array(BW * BH); fg2 = new Uint8Array(BW * BH); lab = new Int32Array(BW * BH);
   bg = null; typicalArea = cfg.typical || 0; detector = { ready: true };
 }
-function relearnBackground() { bg = null; tracks.clear(); }
+function relearnBackground() { bg = null; tracks.clear(); if (fluxer) fluxer.reset(); }
 function detectBlobs() {
   bctx.drawImage(video, 0, 0, BW, BH);
   const d = bctx.getImageData(0, 0, BW, BH).data; const N = BW * BH;
@@ -569,6 +571,229 @@ function detectBlobs() {
   }
   const kx = vw / BW, ky = vh / BH;
   return out.map((b) => ({ x: b.cx * kx, y: b.cy * ky, area: b.area, edge: !!b.edge, aspect: b.aspect || 1, part: !!b.part, bb: { originX: b.x0 * kx, originY: b.y0 * ky, width: (b.x1 - b.x0 + 1) * kx, height: (b.y1 - b.y0 + 1) * ky } }));
+}
+
+// ================================================================ v3 「通過量」方式
+// 人を1人ずつ追いかけず、「線の上を、どれだけの面積が、どちら向きに通ったか」を測って人数に直す。
+//  ・2〜3人が並んで・くっついて通っても、通った面積が2〜3人分なら2〜3人と数える
+//  ・線の上で立ち止まる・行ったり来たりする人は、差し引きゼロなので数えない
+//  ・枠が割れたりくっついたりしても、向きを取り違えない（追跡をしないため）
+// 1人分の通過量（A1）は、1人ずつ通った記録の中央値から自動で覚える。
+function createFlux(o) {
+  const P = Object.assign({
+    W: 240, H: 180, sens: 25, shadow: true,
+    R: 26, S: 12, bin: 4, lat: 4, thick: 1, occTh: 0.3, relTh: 0.5,
+    gapMs: 450, maxMs: 15000, A1: 780, minFrac: 0.3, roundOff: 0.5,
+    learn: true, histN: 30, minHist: 5, learnQ: 0.5, learnRate: 0.3, A1min: 60, A1max: 20000,
+    expo: true,
+  }, o);
+  const { W, H } = P, N = W * H;
+  let bg = null, bgR, bgG, bgB;
+  const gray = new Float32Array(N), fg = new Uint8Array(N), fg2 = new Uint8Array(N);
+  let highSince = 0, fgRatio = 0;
+  // 線（解析用の座標）。両端を15%のばして、画面の端を通る人も拾う
+  const [a, b] = P.line; const f = 0.15, dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy) || 1;
+  const A = { x: a.x - dx * f, y: a.y - dy * f }, B = { x: b.x + dx * f, y: b.y + dy * f };
+  let nx = -dy / L, ny = dx / L; if (P.flip) { nx = -nx; ny = -ny; }   // +n の向き ＝「入場」
+  const ux = dx / L, uy = dy / L, LL = Math.hypot(B.x - A.x, B.y - A.y);
+  const pts = [];
+  for (let s = 0; s <= LL; s += 1) { const x = A.x + ux * s, y = A.y + uy * s; if (x >= 0 && x <= W - 1 && y >= 0 && y <= H - 1) pts.push({ x, y }); }
+  const M = pts.length, R = P.R, K = 2 * R + 1;
+  const Gc = new Float32Array(M * K), Gp = new Float32Array(M * K), Fc = new Uint8Array(M * K);
+  const occ = new Float32Array(M), vel = new Float32Array(M), phi = new Float32Array(M);
+  const lab = new Int32Array(M), prevLab = new Int32Array(M);
+  const costs = new Float64Array(2 * P.S + 1);
+  let havePrev = false, lastT = 0;
+  const events = new Map(); let nextEv = 1;
+  let A1 = P.A1; const massHist = [];
+  let calib = 0;          // 1: 次の通過を「1人分」として覚える
+  let calibMsg = "";
+  const stats = { events: 0, zero: 0 };
+
+  function bil(img, x, y) {
+    x = Math.max(0, Math.min(W - 1.001, x)); y = Math.max(0, Math.min(H - 1.001, y));
+    const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * W + x0;
+    return img[i] * (1 - fx) * (1 - fy) + img[i + 1] * fx * (1 - fy) + img[i + W] * (1 - fx) * fy + img[i + W + 1] * fx * fy;
+  }
+  function segFg(d) {
+    for (let i = 0, j = 0; i < N; i++, j += 4) gray[i] = d[j] * 0.299 + d[j + 1] * 0.587 + d[j + 2] * 0.114;
+    if (!bg) {
+      bg = Float32Array.from(gray); bgR = new Float32Array(N); bgG = new Float32Array(N); bgB = new Float32Array(N);
+      for (let i = 0, j = 0; i < N; i++, j += 4) { bgR[i] = d[j]; bgG[i] = d[j + 1]; bgB[i] = d[j + 2]; }
+      return false;
+    }
+    // iPhoneの自動露出で画面全体が明るく・暗くなった分を打ち消す
+    if (P.expo) {
+      const rs = []; for (let i = 0; i < N; i += 13) if (bg[i] > 20) rs.push(gray[i] / bg[i]);
+      rs.sort((p, q) => p - q); const gain = rs.length ? Math.max(0.6, Math.min(1.6, rs[rs.length >> 1])) : 1;
+      if (Math.abs(gain - 1) > 0.01) for (let i = 0; i < N; i++) gray[i] /= gain;
+    }
+    let cnt = 0; const th = P.sens;
+    for (let i = 0, j = 0; i < N; i++, j += 4) {
+      const diff = Math.abs(gray[i] - bg[i]); let isFg = diff > th;
+      if (isFg && P.shadow) {   // 影（床の色のまま暗くなっただけ）は人に含めない
+        const ratio = (gray[i] + 1) / (bg[i] + 1);
+        if (ratio > 0.3 && ratio < 0.93) {
+          const r = d[j], g = d[j + 1], bb = d[j + 2], s1 = r + g + bb + 3, s2 = bgR[i] + bgG[i] + bgB[i] + 3;
+          const dc = Math.abs(r / s1 - bgR[i] / s2) + Math.abs(g / s1 - bgG[i] / s2) + Math.abs(bb / s1 - bgB[i] / s2);
+          if (dc < 0.06) isFg = false;
+        }
+      }
+      if (isFg) { fg[i] = 1; cnt++; bg[i] += (gray[i] - bg[i]) * 0.002; }
+      else {
+        fg[i] = 0;
+        if (diff > th) { bgR[i] += (d[j] - bgR[i]) * 0.002; bgG[i] += (d[j + 1] - bgG[i]) * 0.002; bgB[i] += (d[j + 2] - bgB[i]) * 0.002; }
+        else { bg[i] += (gray[i] - bg[i]) * 0.05; bgR[i] += (d[j] - bgR[i]) * 0.05; bgG[i] += (d[j + 1] - bgG[i]) * 0.05; bgB[i] += (d[j + 2] - bgB[i]) * 0.05; }
+      }
+    }
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const c = fg[i - W - 1] + fg[i - W] + fg[i - W + 1] + fg[i - 1] + fg[i] + fg[i + 1] + fg[i + W - 1] + fg[i + W] + fg[i + W + 1];
+      fg2[i] = c >= 4 ? 1 : 0;
+    }
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x; fg[i] = (fg2[i] || fg2[i - 1] || fg2[i + 1] || fg2[i - W] || fg2[i + W]) ? 1 : 0;
+    }
+    return cnt / N;
+  }
+  function closeEvent(id, e, found) {
+    events.delete(id);
+    stats.events++;
+    const mass = Math.abs(e.net), m = mass / A1, dir = e.net > 0 ? "in" : "out";
+    if (calib === 1 && m * A1 > A1 * 0.2 && mass > 150 && e.gross < mass * 1.6) {
+      A1 = mass; massHist.length = 0; calib = 0; calibMsg = "1人分の通過量を覚えました";
+      found.push({ dir, k: 1, x0: e.x0, x1: e.x1, calib: true }); return;
+    }
+    const n = m < P.minFrac ? 0 : Math.max(1, Math.floor(m + 1 - P.roundOff));
+    if (!n) { stats.zero++; return; }
+    found.push({ dir, k: n, x0: e.x0, x1: e.x1, m });
+    if (P.learn && m > 0.3 && e.gross < mass * 1.6) {
+      massHist.push(mass); if (massHist.length > P.histN) massHist.shift();
+      if (massHist.length >= P.minHist) {
+        const v = massHist.slice().sort((p, q) => p - q), q = v[Math.floor(v.length * P.learnQ)];
+        A1 = Math.max(P.A1min, Math.min(P.A1max, A1 * (1 - P.learnRate) + q * P.learnRate));
+      }
+    }
+  }
+  function reset() { bg = null; events.clear(); havePrev = false; lab.fill(0); prevLab.fill(0); }
+  // d: RGBAの画素（W×H）、t: ミリ秒。戻り値: このコマで確定した通過 [{dir, k, x0, x1}]
+  function step(d, t) {
+    const found = [];
+    if (lastT && t - lastT > 1500) {   // 画面が消えていた等で間が空いた → 途中の通過は捨てて出直す
+      for (const [id, e] of [...events]) closeEvent(id, e, found);
+      havePrev = false;
+    }
+    const fr = segFg(d); if (fr === false) { lastT = t; return found; }
+    fgRatio = fr;
+    // カメラが動いた・照明が激変した → 数秒続いたら背景を作り直す
+    if (fr > 0.6) { if (!highSince) highSince = t; else if (t - highSince > 4000) { reset(); highSince = 0; lastT = t; return found; } }
+    else highSince = 0;
+    for (let i = 0; i < M; i++) {
+      const p = pts[i];
+      for (let k = -R; k <= R; k++) {
+        const x = p.x + nx * k, y = p.y + ny * k, idx = i * K + k + R;
+        Gc[idx] = bil(gray, x, y);
+        const xi = Math.round(x), yi = Math.round(y);
+        Fc[idx] = (xi >= 0 && xi < W && yi >= 0 && yi < H) ? fg[yi * W + xi] : 0;
+      }
+    }
+    for (let i = 0; i < M; i++) { let s = 0, c = 0; for (let k = -P.thick; k <= P.thick; k++) { s += Fc[i * K + k + R]; c++; } occ[i] = s / c; }
+    lastT = t;
+    // 線の上の動き（線と直角方向に何画素動いたか）を、前のコマとの照合で求める
+    vel.fill(0);
+    if (havePrev) {
+      const S = P.S, bin = P.bin, lat = P.lat;
+      for (let b0 = 0; b0 < M; b0 += bin) {
+        let any = false; for (let i = b0; i < Math.min(M, b0 + bin); i++) if (occ[i] > 0) { any = true; break; }
+        if (!any) continue;
+        const i0 = Math.max(0, b0 - lat), i1 = Math.min(M - 1, b0 + bin - 1 + lat);
+        let best = 1e18, bs = 0;
+        for (let s = -S; s <= S; s++) {
+          let c = 0, n = 0, m1 = 0, m2 = 0;
+          for (let i = i0; i <= i1; i++) { const base = i * K + R; for (let k = -R + S; k <= R - S; k++) { m1 += Gc[base + k]; m2 += Gp[base + k - s]; n++; } }
+          m1 /= n; m2 /= n; n = 0;
+          for (let i = i0; i <= i1; i++) { const base = i * K + R; for (let k = -R + S; k <= R - S; k++) { c += Math.abs(Gc[base + k] - m1 - Gp[base + k - s] + m2); n++; } }
+          c /= n; costs[s + S] = c; if (c < best) { best = c; bs = s; }
+        }
+        let sub = bs;
+        if (bs > -S && bs < S) { const cm = costs[bs + S - 1], c0 = costs[bs + S], cp = costs[bs + S + 1], den = cm - 2 * c0 + cp; if (den > 1e-6) sub = bs + 0.5 * (cm - cp) / den; }
+        if (costs[S] - best < P.relTh) sub = 0;   // はっきり動いていないときは「止まっている」とみなす
+        for (let i = b0; i < Math.min(M, b0 + bin); i++) vel[i] = sub;
+      }
+    }
+    Gp.set(Gc); havePrev = true;
+    // 通過量 ＝ 線の上にいる割合 × 動いた量。時間と線の上でつながった「ひとかたまりの通過」ごとに合計する
+    for (let i = 0; i < M; i++) phi[i] = occ[i] * vel[i];
+    lab.fill(0);
+    let i = 0;
+    while (i < M) {
+      if (occ[i] < P.occTh) { i++; continue; }
+      let j = i, gap = 0;
+      while (j + 1 < M && (occ[j + 1] >= P.occTh || (gap < 2 && j + 2 < M && occ[j + 2] >= P.occTh))) { if (occ[j + 1] < P.occTh) gap++; j++; }
+      const ids = new Set(); for (let q = Math.max(0, i - 3); q <= Math.min(M - 1, j + 3); q++) if (prevLab[q]) ids.add(prevLab[q]);
+      const idl = [...ids].filter((x) => events.has(x));
+      let id;
+      if (!idl.length) { id = nextEv++; events.set(id, { net: 0, gross: 0, x0: i, x1: j, tStart: t, tEnd: t }); }
+      else {
+        id = idl[0]; const e = events.get(id);
+        for (const o2 of idl.slice(1)) {
+          const e2 = events.get(o2); e.net += e2.net; e.gross += e2.gross; e.x0 = Math.min(e.x0, e2.x0); e.x1 = Math.max(e.x1, e2.x1); e.tStart = Math.min(e.tStart, e2.tStart);
+          events.delete(o2); for (let q = 0; q < M; q++) if (lab[q] === o2) lab[q] = id;
+        }
+      }
+      const e = events.get(id);
+      for (let q = i; q <= j; q++) { lab[q] = id; e.net += phi[q]; e.gross += Math.abs(phi[q]); }
+      e.x0 = Math.min(e.x0, i); e.x1 = Math.max(e.x1, j); e.tEnd = t;
+      i = j + 1;
+    }
+    for (const [id, e] of [...events]) if (t - e.tEnd > P.gapMs || t - e.tStart > P.maxMs) closeEvent(id, e, found);
+    prevLab.set(lab);
+    return found;
+  }
+  return {
+    step, reset, pts, occ, vel, occTh: P.occTh,
+    get A1() { return A1; }, set A1(v) { A1 = v; },
+    get samples() { return massHist.length; },
+    get fgRatio() { return fgRatio; }, get active() { return events.size; },
+    armCalib() { calib = 1; calibMsg = "1人だけで線を横切ってください（覚えるまで待機中）"; },
+    get calibMsg() { return calibMsg; }, set calibMsg(v) { calibMsg = v; }, get calibrating() { return calib === 1; },
+    finish(t) { const found = []; for (const [id, e] of [...events]) closeEvent(id, e, found); return found; },
+    stats,
+  };
+}
+
+let fluxer = null, fluxSavedAt = 0;
+const isFlux = () => cfg.method !== "track";
+function makeFluxer() {
+  if (!cfg.line || !vw) { fluxer = null; return; }
+  const k = BW / vw, ky = BH / vh;
+  fluxer = createFlux({ W: BW, H: BH, line: cfg.line.map((p) => ({ x: p.x * k, y: p.y * ky })), flip: cfg.flip,
+    sens: cfg.sens, shadow: cfg.shadow, A1: cfg.a1 || Math.round(780 * (BW * BH) / 43200) });
+}
+function tickFlux(now) {
+  if (!fluxer) makeFluxer(); if (!fluxer) return;
+  bctx.drawImage(video, 0, 0, BW, BH);
+  const d = bctx.getImageData(0, 0, BW, BH).data;
+  const found = fluxer.step(d, now);
+  fgRatio = fluxer.fgRatio;
+  // 表示: 赤線の上で「人がいる所」を、動く向きの色で塗る（緑＝入場向き、橙＝退場向き、白＝止まっている）
+  ctx.clearRect(0, 0, vw, vh); drawLine(cfg.line, false);
+  const kx = vw / BW, ky = vh / BH, r = Math.max(3, vw * 0.006);
+  for (let i = 0; i < fluxer.pts.length; i++) {
+    if (fluxer.occ[i] < fluxer.occTh) continue;
+    const v = fluxer.vel[i]; ctx.fillStyle = v > 0.3 ? "#4cd964" : v < -0.3 ? "#ff9f0a" : "#ffffff";
+    const p = fluxer.pts[i]; ctx.fillRect(p.x * kx - r, p.y * ky - r, r * 2, r * 2);
+  }
+  for (const c of found) {
+    const p0 = fluxer.pts[c.x0], p1 = fluxer.pts[c.x1];
+    const bb = { originX: Math.min(p0.x, p1.x) * kx - 20, originY: Math.min(p0.y, p1.y) * ky - vh * 0.12, width: Math.abs(p1.x - p0.x) * kx + 40, height: vh * 0.24 };
+    if (c.calib) { cfg.a1 = Math.round(fluxer.A1); LS.set("vc_cfg_oh", cfg); renderStatus(); continue; }
+    record(c.dir, c.k, null); evSaveEvent(c.dir, c.k, bb, null);
+    $("live").classList.add("on"); setTimeout(() => $("live").classList.remove("on"), 600);
+    if (c.k > 1) { ctx.fillStyle = "#fff"; ctx.font = "bold 28px sans-serif"; ctx.fillText(`${c.k}人`, bb.originX + bb.width / 2, bb.originY); }
+  }
+  // 覚えた「1人分」はときどき保存（翌日もそのまま使える）
+  if (now - fluxSavedAt > 30000) { fluxSavedAt = now; if (fluxer.samples >= 5) { cfg.a1 = Math.round(fluxer.A1); LS.set("vc_cfg_oh", cfg); } }
 }
 
 // ---------------------------------------------------------------- 設定モード（ライン引き）
@@ -714,6 +939,12 @@ function renderCounts() {
 }
 async function tick() {
   if (mode !== "run" || paused || !detector || video.readyState < 2) return;
+  if (isFlux()) {
+    const t0 = performance.now(); tickFlux(Date.now()); inferMs = inferMs * 0.9 + (performance.now() - t0) * 0.1; processed++;
+    keepPrev(); evPeriodic(); if (processed % 10 === 0) renderStatus();
+    if (cfg.url && Date.now() - lastSendAt > cfg.interval * 60000) send();
+    return;
+  }
   const now = performance.now();
   const t0 = performance.now();
   const dets = window.__vcFake ? window.__vcFake() : detectBlobs();
@@ -822,7 +1053,10 @@ async function tick() {
 }
 function renderStatus() {
   const ev = cfg.evidence ? `  証拠 ${evCount}枚` : "";
-  const s = `${VER}  ${vw}×${vh}  処理 ${inferMs.toFixed(1)}ms/コマ  コマ ${processed}  前景 ${(fgRatio * 100).toFixed(0)}%  1人分 ${typicalArea ? (typicalArea / (BW * BH) * 100).toFixed(1) + "%" : "未学習"}  追跡中 ${tracks.size}` +
+  const who = isFlux()
+    ? `1人分(通過量) ${fluxer ? Math.round(fluxer.A1) : (cfg.a1 || "未")}${fluxer && fluxer.samples < 5 && !cfg.a1 ? "（学習中）" : ""}${fluxer && fluxer.calibMsg ? "  ★" + fluxer.calibMsg : ""}`
+    : `1人分 ${typicalArea ? (typicalArea / (BW * BH) * 100).toFixed(1) + "%" : "未学習"}  追跡中 ${tracks.size}`;
+  const s = `${VER}  ${vw}×${vh}  処理 ${inferMs.toFixed(1)}ms/コマ  コマ ${processed}  前景 ${(fgRatio * 100).toFixed(0)}%  ${who}` +
     ev + (cfg.url ? `  送信 ${lastSendAt ? new Date(lastSendAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "未"}` : "  送信なし（端末内保存）");
   $("status").textContent = s;
 }
@@ -879,6 +1113,7 @@ function showRun() {
   LS.set("vc_running_oh", true); relearnBackground();
   mode = "run"; $("setupBar").style.display = "none"; $("settings").style.display = "none"; $("run").style.display = "block";
   $("hint").style.display = "none"; renderCounts(); renderStatus(); keepAwake(); showGap(); checkOffline();
+  fluxer = null; if (isFlux()) makeFluxer();
   clearInterval(timer); timer = setInterval(tick, 1000 / cfg.fps);
 }
 function showSetup() {
@@ -890,7 +1125,7 @@ function showSetup() {
 function showSettings() {
   mode = "settings"; clearInterval(timer); $("run").style.display = "none"; $("setupBar").style.display = "none"; $("stage").style.display = "none";
   $("settings").style.display = "block";
-  $("optFps").value = cfg.fps; $("optSens").value = cfg.sens; $("optMin").value = cfg.minPct; $("optSplit").value = cfg.split ? "1" : "0"; $("optShadow").value = cfg.shadow ? "1" : "0";
+  $("optMethod").value = cfg.method || "flux"; $("optFps").value = cfg.fps; $("optSens").value = cfg.sens; $("optMin").value = cfg.minPct; $("optSplit").value = cfg.split ? "1" : "0"; $("optShadow").value = cfg.shadow ? "1" : "0";
   $("optCool").value = cfg.cool; $("optRepWin").value = cfg.repWin; $("optRepTh").value = cfg.repTh;
   $("optEvid").value = cfg.evidence ? "1" : "0"; $("optEvEvery").value = cfg.evEvery; $("optEvMax").value = cfg.evMax;
   $("optUrl").value = cfg.url; $("optToken").value = cfg.token; $("optInterval").value = cfg.interval; $("optName").value = cfg.name;
@@ -906,11 +1141,12 @@ $("btnStart").onclick = () => { if (!cfg.line) { alert("先にラインを引い
 $("btnStop").onclick = showSetup;
 $("btnSettings").onclick = showSettings;
 $("btnSaveSettings").onclick = () => {
-  cfg.fps = +$("optFps").value; cfg.sens = +$("optSens").value; cfg.minPct = +$("optMin").value; cfg.split = $("optSplit").value === "1"; cfg.shadow = $("optShadow").value === "1";
+  const newMethod = $("optMethod").value; cfg.method = newMethod; cfg.fps = +$("optFps").value; cfg.sens = +$("optSens").value; cfg.minPct = +$("optMin").value; cfg.split = $("optSplit").value === "1"; cfg.shadow = $("optShadow").value === "1";
   cfg.cool = +$("optCool").value; cfg.repWin = +$("optRepWin").value; cfg.repTh = +$("optRepTh").value;
   cfg.evidence = $("optEvid").value === "1"; cfg.evEvery = +$("optEvEvery").value; cfg.evMax = +$("optEvMax").value;
   cfg.url = $("optUrl").value.trim(); cfg.token = $("optToken").value.trim(); cfg.interval = +$("optInterval").value; cfg.name = $("optName").value.trim() || "入口1";
   const newCam = $("optCam").value; const camChanged = newCam !== (cfg.camId || ""); cfg.camId = newCam;
+  if (camChanged) cfg.a1 = 0;   // レンズが変わると1人分の大きさも変わるので覚え直す
   LS.set("vc_cfg_oh", cfg);
   if (camChanged) startCamera().then(() => { loadModel(); drawSetup(); }).catch((e) => alert("カメラを切り替えられません: " + e.message));
   showSetup();
@@ -920,6 +1156,12 @@ $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = pa
 $("btnDim").onclick = () => { $("dim").style.display = "block"; };
 $("btnRelearn").onclick = () => { relearnBackground(); };
 $("btnOne").onclick = () => {
+  if (isFlux()) {
+    if (!fluxer) makeFluxer(); if (!fluxer) return;
+    fluxer.armCalib(); renderStatus();
+    alert("このあと、1人だけで赤線をふつうに歩いて横切ってください（どちら向きでも可）。通り終わると自動で覚えます。\n覚えるための1回は人数に数えません。\n※押さなくても、通った人から自動で覚えていきます");
+    return;
+  }
   // いま映っている一番大きな塊を「1人分」として記憶（1人だけ映っている状態で押す）
   const dets = detectBlobs();
   if (!dets.length) { alert("人が映っていません。1人だけカメラの下に立ってから押してください"); return; }
