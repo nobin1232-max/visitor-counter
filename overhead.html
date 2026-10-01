@@ -91,6 +91,7 @@
     <div id="offline"></div>
     <div class="bar">
       <button id="btnDim">画面を暗く</button>
+      <button id="btnPip">小窓で表示</button>
       <button id="btnRelearn">背景を学習し直す</button>
       <button id="btnOne">1人分を覚えさせる</button>
       <button id="btnPause">一時停止</button>
@@ -163,7 +164,7 @@ const LS = {
 };
 const CFG_DEF = { lean: "more", line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.8（10/1 「除いた推定」の表示をやめる）";
+const VER = "頭上版 v3.9（10/1 小窓で手前に表示）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v3.6: 1人分の覚え方を変えたので、以前に覚えた値は一度だけ捨てて覚え直す
@@ -1298,6 +1299,7 @@ function showRun() {
   $("hint").style.display = "none"; renderCounts(); renderStatus(); keepAwake(); showGap(); checkOffline();
   fluxer = null; if (isFlux()) makeFluxer();
   clearInterval(timer); timer = setInterval(tick, 1000 / cfg.fps);
+  pipInit();   // v3.9
 }
 function showSetup() {
   LS.set("vc_running_oh", false);
@@ -1337,6 +1339,53 @@ $("btnSaveSettings").onclick = () => {
 $("btnReset").onclick = () => { if (confirm("カウントと記録をすべて消します。よろしいですか？")) { data = { totalIn: 0, totalOut: 0, repIn: 0, repOut: 0, manIn: 0, manOut: 0, chkIn: 0, chkOut: 0, hourly: {}, events: [] }; recentSigs = []; recentPass = []; LS.set("vc_data_oh", data); gaps = []; LS.set("vc_gaps_oh", gaps); showGap(); renderCounts(); $("logBox").value = csvText(); } };
 $("btnPause").onclick = () => { paused = !paused; $("btnPause").textContent = paused ? "再開" : "一時停止"; };
 $("btnDim").onclick = () => { $("dim").style.display = "block"; };
+// v3.9: 小窓（ピクチャ・イン・ピクチャ）。カメラ映像と入場・退場の数を、ほかのアプリより手前に浮かべる。
+//       再生中の動画として扱われるので、窓が隠れても計測が止められにくくなる。
+const pipCv = document.createElement("canvas"); pipCv.width = 480; pipCv.height = 480;
+const pipCtx = pipCv.getContext("2d");
+const pipVid = document.createElement("video");
+pipVid.muted = true; pipVid.playsInline = true; pipVid.setAttribute("playsinline", ""); pipVid.setAttribute("muted", "");
+pipVid.style.cssText = "position:fixed;right:0;bottom:0;width:4px;height:4px;opacity:0.01;pointer-events:none;z-index:-1;";
+let pipStream = null, pipTimer = 0, pipOn = false;
+function drawPip() {
+  const W = pipCv.width, H = pipCv.height, VH = Math.round(W * 0.75);
+  pipCtx.fillStyle = "#000"; pipCtx.fillRect(0, 0, W, H);
+  try { if (video.readyState >= 2) pipCtx.drawImage(video, 0, 0, W, VH); if (overlay.width) pipCtx.drawImage(overlay, 0, 0, W, VH); } catch (e) {}
+  pipCtx.textAlign = "center"; pipCtx.textBaseline = "middle";
+  pipCtx.font = "bold 72px -apple-system, 'Hiragino Sans', sans-serif";
+  pipCtx.fillStyle = "#4cd964"; pipCtx.fillText(String(data.totalIn), W * 0.27, VH + 48);
+  pipCtx.fillStyle = "#ff9f0a"; pipCtx.fillText(String(data.totalOut), W * 0.73, VH + 48);
+  pipCtx.font = "18px -apple-system, 'Hiragino Sans', sans-serif"; pipCtx.fillStyle = "#aaa";
+  pipCtx.fillText("入場", W * 0.27, H - 14); pipCtx.fillText("退場", W * 0.73, H - 14);
+  if (paused) { pipCtx.fillStyle = "rgba(0,0,0,0.6)"; pipCtx.fillRect(0, 0, W, VH); pipCtx.fillStyle = "#fff"; pipCtx.font = "bold 36px sans-serif"; pipCtx.fillText("一時停止中", W / 2, VH / 2); }
+}
+function pipInit() {   // 計測開始のときに準備しておく（ボタンを押した瞬間にすぐ小窓にできるように）
+  try {
+    if (!pipVid.parentNode) document.body.appendChild(pipVid);
+    if (!pipStream && pipCv.captureStream) { drawPip(); pipStream = pipCv.captureStream(4); pipVid.srcObject = pipStream; }
+    if (!pipTimer) pipTimer = setInterval(drawPip, 1000);
+    const p = pipVid.play(); if (p && p.catch) p.catch(() => {});
+  } catch (e) {}
+}
+function pipSetRate(on) { pipOn = on; clearInterval(pipTimer); pipTimer = setInterval(drawPip, on ? 250 : 1000); $("btnPip").textContent = on ? "小窓を閉じる" : "小窓で表示"; }
+pipVid.addEventListener("enterpictureinpicture", () => pipSetRate(true));
+pipVid.addEventListener("leavepictureinpicture", () => pipSetRate(false));
+pipVid.addEventListener("webkitpresentationmodechanged", () => pipSetRate(pipVid.webkitPresentationMode === "picture-in-picture"));
+$("btnPip").onclick = () => {
+  try {
+    pipInit();
+    if (pipOn) {
+      if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
+      else if (pipVid.webkitSetPresentationMode) pipVid.webkitSetPresentationMode("inline");
+      return;
+    }
+    if (pipVid.webkitSupportsPresentationMode && pipVid.webkitSupportsPresentationMode("picture-in-picture")) {
+      pipVid.webkitSetPresentationMode("picture-in-picture");   // Safari
+    } else if (pipVid.requestPictureInPicture) {
+      pipVid.requestPictureInPicture().catch((e) => { $("status").textContent = "小窓にできませんでした（" + e.message + "）"; });
+    } else { $("status").textContent = "このブラウザは小窓に対応していません"; }
+  } catch (e) { $("status").textContent = "小窓にできませんでした（" + e.message + "）"; }
+};
 $("mInPlus").onclick = () => manualAdjust("in", 1); $("mOutPlus").onclick = () => manualAdjust("out", 1);
 $("mInMinus").onclick = () => { if (confirm("入場を1減らしますか？")) manualAdjust("in", -1); };
 $("mOutMinus").onclick = () => { if (confirm("退場を1減らしますか？")) manualAdjust("out", -1); };
