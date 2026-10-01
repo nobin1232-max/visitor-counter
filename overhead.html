@@ -163,7 +163,7 @@ const LS = {
 };
 const CFG_DEF = { lean: "more", line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.7（10/1 広角の補正：線の区間ごとに1人分を覚える）";
+const VER = "頭上版 v3.8（10/1 「除いた推定」の表示をやめる）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v3.6: 1人分の覚え方を変えたので、以前に覚えた値は一度だけ捨てて覚え直す
@@ -448,7 +448,7 @@ function repText() {
   let s = "";
   if (cfg.method !== "track") s = `要確認: 入場${data.chkIn || 0}・退場${data.chkOut || 0}`;   // v3.5
   if (cfg.repWin) s += (s ? "　" : "") + (!r ? "同一人物らしき再通過: 0件"
-    : `同一人物らしき再通過: ${r}件（入場${data.repIn || 0}・退場${data.repOut || 0}）　→ 除いた推定: 入場 ${data.totalIn - (data.repIn || 0)} ／ 退場 ${data.totalOut - (data.repOut || 0)}`);
+    : `同一人物らしき再通過: ${r}件（入場${data.repIn || 0}・退場${data.repOut || 0}）`);   // v3.8: 「除いた推定」は v3.6 以降は少なく出すぎるので表示しない
   return s;
 }
 
@@ -1261,7 +1261,6 @@ function csvText() {
   for (const h of Object.keys(data.hourly).sort()) t += `${h},${data.hourly[h].in},${data.hourly[h].out}\n`;
   t += `合計,${data.totalIn},${data.totalOut}\n`;
   t += `同一人物らしき再通過,${data.repIn || 0},${data.repOut || 0}\n`;
-  t += `再通過を除いた推定,${data.totalIn - (data.repIn || 0)},${data.totalOut - (data.repOut || 0)}\n`;
   t += `うち手動で直した分,${data.manIn || 0},${data.manOut || 0}\n`;
   t += `要確認の通過（数は減らしていない）,${data.chkIn || 0},${data.chkOut || 0}\n\n時刻,向き,同一人物らしき,手動,要確認\n`;
   for (const [ts, dir, rep, man, chk] of data.events) t += `${new Date(ts).toLocaleString("ja-JP")},${dir === "in" ? "入場" : "退場"},${rep ? "○" : ""},${man || ""},${chk || ""}\n`;
