@@ -164,7 +164,7 @@ const LS = {
 };
 const CFG_DEF = { lean: "more", line: null, flip: false, fps: 12, method: "flux", a1: 0, sens: 25, cool: 0, minPct: 0.6, split: true, typical: 0, shadow: true,
   url: "", token: "", interval: 5, name: "入口1", camId: "", evidence: true, evEvery: 10, evMax: 3000, repWin: 15, repTh: 11 };
-const VER = "頭上版 v3.9（10/1 小窓で手前に表示）";
+const VER = "頭上版 v3.10（10/3 手動で直した分の表示をやめる）";
 // 以前のバージョンで保存した設定に、新しい項目を足して読み込む
 let cfg = Object.assign({}, CFG_DEF, LS.get("vc_cfg_oh", {}));
 // v3.6: 1人分の覚え方を変えたので、以前に覚えた値は一度だけ捨てて覚え直す
@@ -1099,7 +1099,8 @@ function renderCounts() {
   $("miniCount").textContent = `${data.totalIn} / ${data.totalOut}`;
   if ($("rep")) $("rep").textContent = repText();
   const mi = data.manIn || 0, mo = data.manOut || 0, el = $("manTxt");
-  if (el) { el.style.display = (mi || mo) ? "block" : "none"; const f = (v) => (v > 0 ? "+" : v < 0 ? "−" : "±") + Math.abs(v); el.textContent = `うち手動で直した分: 入場 ${f(mi)} ／ 退場 ${f(mo)}`; }
+  if (el) { el.style.display = "none";   // v3.10: 手動で直した分は画面に出さない（CSVには残す）
+    const f = (v) => (v > 0 ? "+" : v < 0 ? "−" : "±") + Math.abs(v); el.textContent = `うち手動で直した分: 入場 ${f(mi)} ／ 退場 ${f(mo)}`; }
 }
 // v3.4: 手動で足す（delta=+1）・引く（delta=-1）。数え漏れ・数えすぎを見たときに使う
 function manualAdjust(dir, delta) {
